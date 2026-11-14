@@ -1,0 +1,1120 @@
+# MASTER DEVELOPMENT PROMPT
+# Field Shift — NASA-Powered Smart Agriculture Platform
+## Complete Feature Integration & Sequential Implementation Plan
+
+Act as a Senior Full-Stack Software Engineer, Software Architect, AI Engineer, Agricultural Data Analyst, and UI/UX Developer.
+
+Your task is to enhance my existing project, **Field Shift**, and transform it into a complete, functional, scientifically responsible smart agriculture decision-support platform for farmers in Luxor, Egypt.
+
+This is an existing project. You must understand and extend its current implementation rather than creating a replacement.
+
+The project is developed for:
+
+**NASA Space Apps Challenge 2026**
+**Challenge 7: Adapting Farms with NASA Data**
+
+Primary geographical focus: Luxor, Egypt.
+
+The platform should be particularly useful for sugarcane cultivation while supporting other crops when reliable agricultural data is available.
+
+---
+
+# PART 1 — CRITICAL PROJECT RULES
+
+Follow these instructions throughout the entire development process.
+
+1. Do NOT create a new website from scratch.
+2. Do NOT replace the existing project architecture without a strong technical reason.
+3. Do NOT remove, disable, or break existing working functionality.
+4. Preserve the existing Field Shift project identity and branding.
+5. Preserve the current design system, colors, typography, navigation, and layout wherever possible.
+6. Maintain Arabic and English language support if already implemented.
+7. Implement actual functionality, not static UI mockups.
+8. Reuse existing APIs, components, services, calculations, and database models wherever possible.
+9. Connect new features to the existing NASA POWER integration.
+10. Do not create duplicate APIs or duplicate data-processing systems unnecessarily.
+11. Never fabricate NASA data, agricultural measurements, scientific thresholds, API responses, or model predictions.
+12. Clearly distinguish actual observations, historical averages, forecasts, and model-generated estimates.
+13. Do not expose API keys, passwords, credentials, private files, or environment secrets.
+14. Do not introduce unnecessary dependencies.
+15. Keep the application responsive on desktop, tablet, and mobile.
+16. Do not change the existing project name to AgriWise. The project identity is Field Shift unless the existing source code establishes a different internal naming convention.
+
+**Most important:** The final result must be a working agricultural platform, not just a collection of attractive dashboard screens.
+
+---
+
+# PART 2 — PROJECT INSPECTION AND BASELINE
+
+Before modifying any code, inspect the complete project.
+
+You may receive two archives:
+
+- FieldShift-GitHub.zip: cleaned project version.
+- Original TAR archive: original development version containing additional project files.
+
+Perform the following:
+
+1. Extract both archives.
+2. Compare their directory structures and source files.
+3. Identify the most complete and reliable implementation.
+4. Identify missing files and differences.
+5. Understand the existing frontend and backend architecture.
+6. Inspect the database and data models.
+7. Inspect all existing API endpoints.
+8. Inspect NASA POWER integration.
+9. Inspect existing crop recommendation functionality.
+10. Inspect the current dashboard and navigation.
+11. Inspect localization and translation mechanisms.
+12. Identify bugs, incomplete modules, and technical limitations.
+
+Do not blindly overwrite one archive with the other.
+
+Use the existing implementation as the foundation.
+
+Create a baseline inventory of existing functionality before development.
+
+Do not expose secret values found in local configuration files.
+
+After the initial inspection, proceed with the implementation plan below. Do not stop after producing an analysis report.
+
+---
+
+# PART 3 — COMPLETE FEATURE SCOPE
+
+Implement all seven features in the following order.
+
+## FEATURE 1 — SMART PLANTING TIME ADVISOR
+
+<badge>Priority 1 — Highest</badge>
+
+Create a dedicated tool named:
+
+**Smart Planting Time Advisor**
+
+Main question:
+
+**Plant Now or Wait?**
+
+Its purpose is to help farmers identify the most suitable planting season and planting period for a selected crop and geographical location.
+
+### 1. User Interface
+
+Create a dedicated section containing:
+
+- Crop name text input.
+- Autocomplete suggestions for supported crops.
+- Farm location selection using the existing location map.
+- Optional crop variety input.
+- Analyze Planting Time button.
+
+The user should be able to type crop names directly, including:
+
+- Sugarcane.
+- Wheat.
+- Maize.
+- Rice.
+- Tomato.
+- Potato.
+- Onion.
+
+Do not restrict the user to a dropdown.
+
+### 2. Agricultural Knowledge Database
+
+Create or improve a structured crop requirements database.
+
+For each supported crop, include documented information about:
+
+- Scientific name.
+- Suitable planting seasons.
+- Recommended planting months.
+- Optimum temperature range.
+- Minimum and maximum temperature tolerance, when documented.
+- Rainfall and water requirements.
+- Relative humidity requirements, when available.
+- Solar radiation requirements, when available.
+- Growth duration.
+- Agricultural references.
+
+Use reliable sources, including:
+
+- FAO publications.
+- Egyptian agricultural extension publications.
+- Recognized scientific agricultural references.
+
+Every important agricultural threshold must have a traceable source.
+
+Do not invent missing values.
+
+If a crop is unsupported, clearly explain that verified requirements are unavailable.
+
+### 3. NASA POWER Climate Analysis
+
+Retrieve available climate data for the selected coordinates using the existing NASA POWER integration.
+
+Analyze the following parameters:
+
+| Parameter | NASA POWER variable |
+|---|---|
+| Average temperature | T2M |
+| Maximum temperature | T2M_MAX |
+| Minimum temperature | T2M_MIN |
+| Precipitation | PRECTOTCORR |
+| Relative humidity | RH2M |
+| Solar radiation | ALLSKY_SFC_SW_DWN |
+| Wind speed | WS10M |
+
+Use multiple years of historical climate data to identify local seasonal patterns.
+
+Do not use only the latest 365 days to determine normal planting seasons.
+
+Analyze:
+
+- Historical monthly temperature patterns.
+- Maximum and minimum temperature.
+- Rainfall distribution.
+- Solar radiation.
+- Relative humidity.
+- Possible heat stress.
+- Possible cold stress.
+- Seasonal climate suitability.
+
+Respect the temporal resolution and units of each NASA POWER variable.
+
+Do not treat historical climate data as real-time weather.
+
+### 4. Planting Season Decision
+
+Determine whether the selected crop is normally suitable for:
+
+- Summer planting.
+- Winter planting.
+- Spring planting.
+- Autumn planting.
+- Multiple planting seasons.
+
+The recommendation must depend on:
+
+- Selected crop.
+- Selected geographical location.
+- Documented crop requirements.
+- Historical climate patterns.
+
+Do not hardcode a planting season based only on the crop name.
+
+### 5. Plant Now or Wait Decision
+
+Display one of three results:
+
+- PLANT NOW.
+- WAIT.
+- NOT RECOMMENDED.
+
+Explain the decision using documented crop requirements and available environmental data.
+
+For each result, display:
+
+- Recommended planting season.
+- Best planting month or planting window.
+- Alternative suitable months.
+- Available current weather information, if connected.
+- Crop temperature requirements.
+- Temperature suitability.
+- Rainfall suitability.
+- Potential heat or cold stress.
+- Scientific explanation.
+
+Important:
+
+A historical climate average cannot independently confirm that today's weather is suitable for planting.
+
+If actual current observations or forecast data are unavailable, clearly label the result as a historical seasonal recommendation rather than a real-time planting decision.
+
+Do not claim NASA POWER provides a weather forecast.
+
+If necessary, use a separate reliable weather API for current conditions and forecasts, and clearly identify its source.
+
+### 6. Annual Planting Suitability Chart
+
+Create an interactive 12-month chart.
+
+For each month, display:
+
+- Suitable.
+- Partially suitable.
+- Unsuitable.
+- Data unavailable.
+
+Use:
+
+- Green for suitable.
+- Yellow for partially suitable.
+- Red for unsuitable.
+- Neutral styling for unavailable data.
+
+When a farmer selects a month, show:
+
+- Historical climate conditions.
+- Documented crop requirements.
+- Explanation of the suitability result.
+
+Do not generate arbitrary monthly scores.
+
+### 7. Results Dashboard
+
+Display:
+
+- Plant Now or Wait decision.
+- Recommended planting season.
+- Best planting month.
+- Temperature suitability.
+- Rainfall suitability.
+- Historical climate chart.
+- Monthly suitability chart.
+- Scientific explanation.
+- Data sources.
+
+Use simple farmer-friendly explanations in Arabic while retaining relevant English scientific terminology.
+
+---
+
+## FEATURE 2 — CLIMATE RISK ALERT SYSTEM
+
+<badge>Priority 2 — High</badge>
+
+Create a dedicated system named:
+
+**Climate Risk Monitoring**
+
+Its purpose is to analyze climate conditions and identify agricultural risks for the selected crop and location.
+
+### 1. Climate Variables
+
+Analyze available data for:
+
+- Maximum temperature.
+- Minimum temperature.
+- Average temperature.
+- Precipitation.
+- Solar radiation.
+- Wind speed, if available.
+
+Reuse the existing NASA POWER integration wherever applicable.
+
+### 2. Risk Detection
+
+Identify potential agricultural risks:
+
+1. Extreme heat.
+2. Cold stress.
+3. Drought conditions.
+4. Unusual rainfall patterns.
+5. Climate conditions outside the selected crop's suitable range.
+
+Use crop-specific, scientifically documented thresholds.
+
+Do not apply the same thresholds to every crop.
+
+For drought assessment, use appropriate historical comparisons and documented methods. Do not classify a location as experiencing drought from a single low-rainfall observation.
+
+### 3. Risk Classification
+
+Display three risk levels:
+
+- Low Risk.
+- Moderate Risk.
+- High Risk.
+
+If information is insufficient, display Data Unavailable rather than assigning an unsupported risk level.
+
+### 4. Risk Details
+
+For every detected risk, display:
+
+- Risk type.
+- Measured climate value.
+- Measurement date and temporal resolution.
+- Suitable crop threshold or reference range.
+- Risk classification.
+- Potential agricultural impact.
+- Practical recommendations for farmers.
+- Scientific reference.
+
+### 5. Risk Dashboard
+
+Create a visual dashboard with:
+
+- Risk summary cards.
+- Colored risk indicators.
+- Historical climate charts.
+- Temperature trends.
+- Rainfall trends.
+- Solar radiation trends.
+- Risk history when sufficient records exist.
+
+### 6. Early Warnings
+
+If reliable forecast data is available, provide early warnings.
+
+Clearly distinguish:
+
+- Historical observations.
+- Latest available observations.
+- Forecast values.
+- Model-generated estimates.
+
+Do not describe historical NASA POWER data as a forecast.
+
+Do not generate fake notifications or claim a warning was delivered if no notification mechanism exists.
+
+---
+
+## FEATURE 3 — SMART IRRIGATION ADVISOR
+
+<badge>Priority 3 — High</badge>
+
+Create a tool named:
+
+**Smart Irrigation Advisor**
+
+Its purpose is to provide practical irrigation guidance based on crop requirements and available environmental information.
+
+### 1. Inputs
+
+Allow the farmer to enter:
+
+- Crop type.
+- Farm location.
+- Crop growth stage.
+- Soil type, if known.
+- Irrigation water availability.
+- Irrigation system, if known.
+
+Automatically reuse the selected crop and location from other tools where appropriate.
+
+### 2. Environmental Analysis
+
+Analyze available information about:
+
+- Temperature.
+- Solar radiation.
+- Relative humidity.
+- Rainfall.
+- Crop water requirements.
+- Evapotranspiration, when sufficient inputs are available.
+
+### 3. Scientific Calculation
+
+Use FAO-56 Penman–Monteith methodology only when the required meteorological inputs are available.
+
+Distinguish between:
+
+- Reference evapotranspiration (ET0).
+- Crop coefficient (Kc).
+- Crop evapotranspiration (ETc).
+- Effective rainfall.
+- Irrigation requirement.
+
+Do not calculate unsupported irrigation quantities.
+
+Do not assume NASA POWER directly measures soil moisture.
+
+Do not invent soil characteristics, crop coefficients, or irrigation efficiency.
+
+### 4. Results
+
+Display:
+
+- General irrigation guidance.
+- Factors increasing water demand.
+- Factors reducing water demand.
+- Water-management recommendations.
+- Crop growth stage considerations.
+- Explanation of calculations.
+- Data availability and limitations.
+
+If required information is missing, provide general guidance without claiming an exact irrigation quantity.
+
+---
+
+## FEATURE 4 — SMART CROP CALENDAR
+
+<badge>Priority 4 — High</badge>
+
+Create a dedicated feature named:
+
+**Smart Crop Calendar**
+
+Its purpose is to provide a dynamic crop-specific agricultural calendar based on the selected crop and geographical location.
+
+### 1. Crop Selection
+
+Automatically identify the selected crop from the existing Crop Recommendation System or Smart Planting Time Advisor.
+
+Allow farmers to switch between different recommended crops.
+
+Update the calendar automatically when the selected crop changes.
+
+### 2. Crop Growth Stages
+
+Generate a crop calendar containing:
+
+1. Recommended planting period.
+2. Germination stage.
+3. Vegetative growth stage.
+4. Development stage.
+5. Maturation stage.
+6. Expected harvesting period.
+
+Use crop-specific growth durations and documented agricultural information.
+
+Do not assume that every crop follows identical growth stages.
+
+### 3. Growth Stage Details
+
+For every stage, display:
+
+- Stage name.
+- Expected time period.
+- Expected duration.
+- Main environmental requirements.
+- Important agricultural activities.
+- Water-management recommendations.
+- Potential climate risks.
+
+### 4. Location Adaptation
+
+Adapt the calendar according to:
+
+- Geographical location.
+- Recommended planting date.
+- Crop variety, when known.
+- Available climate data.
+- Documented crop growth requirements.
+
+Use actual planting dates when entered by the farmer.
+
+If no planting date is available, generate a proposed calendar based on the recommended planting window and clearly label it as a planning estimate.
+
+### 5. Interactive Timeline
+
+Create a visual interactive timeline showing all crop growth stages.
+
+Include:
+
+- Stage names.
+- Start and end dates.
+- Current stage indicator when a real planting date exists.
+- Important agricultural activities.
+- Irrigation guidance.
+- Relevant climate risk alerts.
+
+Make the calendar responsive and easy to understand.
+
+---
+
+## FEATURE 5 — SATELLITE FIELD MONITORING
+
+<badge>Priority 5 — High</badge>
+
+Create a dedicated section named:
+
+**Satellite Field Monitoring**
+
+Its purpose is to monitor agricultural fields using real satellite observations.
+
+### 1. Data Sources
+
+Use appropriate satellite sources such as Sentinel-2 when a reliable technical integration is available.
+
+Investigate suitable APIs and services, including official or documented satellite data access services.
+
+Do not invent an integration.
+
+### 2. Field Selection
+
+Allow users to:
+
+- Select an agricultural location.
+- Define a field boundary when supported.
+- View available satellite observations.
+- Select an observation date.
+
+### 3. Satellite Analysis
+
+Implement:
+
+- Satellite imagery display.
+- NDVI calculation when suitable imagery is available.
+- Vegetation monitoring over time.
+- Comparison between available observation dates.
+- Visualization of vegetation changes.
+
+Use the appropriate Sentinel-2 bands and documented calculation methods.
+
+NDVI:
+
+NDVI = (NIR - RED) / (NIR + RED)
+
+### 4. Monitoring Results
+
+Display:
+
+- Satellite imagery.
+- Acquisition date.
+- Spatial resolution.
+- NDVI value.
+- NDVI visualization.
+- Vegetation change over time.
+- Short explanation of vegetation indicators.
+
+### 5. Data Quality
+
+Handle:
+
+- Cloud cover.
+- Missing observations.
+- Invalid imagery.
+- Missing bands.
+- Different observation dates.
+
+Do not claim that NDVI alone can diagnose diseases, nutrient deficiencies, or exact crop health conditions.
+
+If satellite integration cannot be completed because of API access or credentials, clearly identify the blocker and provide a functional, honest integration-ready implementation rather than fake satellite imagery or measurements.
+
+---
+
+## FEATURE 6 — EXPECTED CROP YIELD ESTIMATION
+
+<badge>Priority 6 — Medium</badge>
+
+Create an optional feature named:
+
+**Expected Crop Yield Estimation**
+
+Its purpose is to estimate potential agricultural production using reliable agricultural models and sufficient input data.
+
+### 1. Farmer Inputs
+
+Allow the farmer to enter:
+
+- Crop type.
+- Farm area.
+- Crop variety.
+- Planting date.
+- Soil information.
+- Irrigation conditions.
+- Crop growth stage.
+
+Reuse information already available in the platform when possible.
+
+### 2. Estimation Methodology
+
+Use scientifically documented crop-yield models or reliable agricultural datasets.
+
+Consider:
+
+- Crop characteristics.
+- Historical climate conditions.
+- Water availability.
+- Soil characteristics.
+- Planting period.
+- Crop development stage.
+- Relevant agricultural management information.
+
+Do not estimate yield using NASA POWER climate data alone.
+
+Do not invent model parameters or training data.
+
+### 3. Results
+
+Display:
+
+- Estimated yield range, when scientifically supported.
+- Expected production for the selected farm area.
+- Main factors affecting yield.
+- Data used.
+- Model or methodology used.
+- Estimation uncertainty.
+- Missing information.
+- Important limitations.
+
+Clearly label results as estimates, not guaranteed production.
+
+If there is insufficient information for a valid estimate, explain exactly what additional information is required instead of producing an unsupported number.
+
+---
+
+## FEATURE 7 — FARMER ACTION CENTER
+
+<badge>Priority 7 — Final Integration</badge>
+
+Create a central dashboard named:
+
+**Farmer Action Center**
+
+Its purpose is to combine useful results from all implemented features into one practical interface.
+
+### 1. Dashboard Content
+
+Bring together:
+
+- Existing crop recommendations.
+- Plant Now or Wait decision.
+- Recommended planting season.
+- Best planting month.
+- Climate risk alerts.
+- Irrigation guidance.
+- Crop growth calendar.
+- Satellite monitoring results, when available.
+- Expected yield estimation, when available.
+
+### 2. Recommendation Prioritization
+
+Organize recommendations by:
+
+- Urgency.
+- Agricultural importance.
+- Relevant crop growth stage.
+- Data confidence.
+- Recommended action.
+
+### 3. Farmer-Friendly Interface
+
+Display:
+
+- Important alerts.
+- Recommended next actions.
+- Relevant dates.
+- Environmental indicators.
+- Links to detailed feature pages.
+
+Use concise Arabic explanations while supporting English language switching.
+
+### 4. Data Integration
+
+The Farmer Action Center must consume actual results from the implemented features.
+
+Do not create duplicate calculations or hardcoded dashboard values.
+
+If a feature has unavailable data, show an appropriate empty or unavailable state.
+
+---
+
+# PART 4 — NASA POWER INTEGRATION
+
+Audit and improve the existing NASA POWER connection.
+
+Use the official NASA POWER API.
+
+Documentation:
+https://power.larc.nasa.gov/docs/
+
+### Required Variables
+
+- T2M
+- T2M_MAX
+- T2M_MIN
+- PRECTOTCORR
+- RH2M
+- ALLSKY_SFC_SW_DWN
+- WS10M
+
+### Requirements
+
+1. Verify latitude and longitude.
+2. Verify requested date ranges.
+3. Use appropriate temporal resolutions.
+4. Parse API responses correctly.
+5. Convert units correctly.
+6. Handle missing and invalid values.
+7. Handle API failures and timeouts.
+8. Display the latest available observation date.
+9. Support multiple years of historical climate data.
+10. Avoid unnecessary repeated API calls.
+11. Use caching when appropriate.
+12. Maintain a consistent data structure for all features.
+
+### Data Classification
+
+Every climate result must clearly identify its data type:
+
+- Historical data.
+- Latest available observation.
+- Forecast data.
+- Calculated value.
+- Estimated value.
+
+Never replace missing real data with fabricated values.
+
+Never assume the latest available NASA POWER observation represents the current weather.
+
+---
+
+# PART 5 — DATA SOURCES AND SCIENTIFIC REFERENCES
+
+Improve the existing Data Sources page.
+
+Include relevant, working references to:
+
+### Climate and Satellite Data
+
+- NASA POWER API.
+- NASA POWER methodology.
+- Sentinel-2 documentation.
+- Appropriate satellite data access documentation.
+
+### Agricultural Science
+
+- FAO crop water requirements.
+- FAO-56 evapotranspiration methodology.
+- Egyptian agricultural extension publications.
+- Reliable crop-specific scientific references.
+
+### Requirements
+
+- Do not invent source URLs.
+- Do not fabricate citations.
+- Display which sources are used by each feature.
+- Associate scientific thresholds with their references.
+- Distinguish source data from calculations derived by the platform.
+
+---
+
+# PART 6 — DESIGN AND USER EXPERIENCE
+
+Preserve the existing Field Shift visual identity.
+
+Do not redesign the entire website unnecessarily.
+
+Maintain:
+
+- Existing colors.
+- Existing typography.
+- Existing navigation.
+- Existing components.
+- Existing dashboard structure.
+
+Improve usability where necessary.
+
+### Required UX Improvements
+
+- Professional agricultural technology appearance.
+- Clear dashboard sections.
+- Responsive desktop and mobile layouts.
+- Arabic and English language support.
+- Interactive charts.
+- Readable data cards.
+- Simple farmer-friendly explanations.
+- Consistent visual hierarchy.
+- Loading indicators.
+- Error messages.
+- Empty states.
+- Clear data-source labels.
+- Accessible controls and readable typography.
+
+Add the seven features to the existing navigation and dashboard using a logical structure.
+
+Avoid overcrowding the main dashboard.
+
+Use detailed feature pages where appropriate.
+
+---
+
+# PART 7 — SEQUENTIAL IMPLEMENTATION WORKFLOW
+
+This is a mandatory requirement.
+
+Implement the seven features sequentially, not all at once.
+
+Follow this exact order:
+
+<badge>Phase 0</badge>
+
+### STEP 0 — Inspect and Prepare
+
+- Extract both archives.
+- Compare the project versions.
+- Inspect the architecture.
+- Establish a working baseline.
+- Check existing functionality.
+- Identify required dependencies.
+- Prepare a safe development branch or backup.
+
+Do not remove working code.
+
+<badge>Phase 1</badge>
+
+### STEP 1 — Smart Planting Time Advisor
+
+- Implement the agricultural knowledge database.
+- Improve NASA POWER integration if necessary.
+- Implement historical climate analysis.
+- Implement planting season logic.
+- Implement Plant Now / Wait / Not Recommended decisions.
+- Implement the interactive 12-month chart.
+- Test with Sugarcane in Luxor.
+- Test with other supported crops.
+
+**Completion gate:** Do not proceed until the feature has been tested and its limitations documented.
+
+<badge>Phase 2</badge>
+
+### STEP 2 — Climate Risk Alert System
+
+- Implement crop-specific risk analysis.
+- Implement risk classification.
+- Implement risk explanations.
+- Implement farmer recommendations.
+- Implement historical trends.
+- Integrate reliable forecasts if available.
+
+**Completion gate:** Verify thresholds, classifications, data labels, and error handling.
+
+<badge>Phase 3</badge>
+
+### STEP 3 — Smart Irrigation Advisor
+
+- Implement irrigation inputs.
+- Implement crop water requirement logic.
+- Implement ET0 calculations when possible.
+- Implement ETc calculations when inputs support them.
+- Implement farmer recommendations.
+
+**Completion gate:** Validate calculations and ensure no unsupported irrigation quantities are displayed.
+
+<badge>Phase 4</badge>
+
+### STEP 4 — Smart Crop Calendar
+
+- Implement crop growth stages.
+- Connect crop selection to the existing recommendation system.
+- Implement planting and harvesting periods.
+- Implement the interactive timeline.
+- Integrate relevant irrigation and climate information.
+
+**Completion gate:** Test crop switching, planting dates, stage dates, and calendar updates.
+
+<badge>Phase 5</badge>
+
+### STEP 5 — Satellite Field Monitoring
+
+- Identify a reliable satellite data source.
+- Implement field selection.
+- Implement imagery retrieval.
+- Implement NDVI calculations.
+- Implement historical comparisons.
+- Handle clouds and missing observations.
+
+**Completion gate:** Verify imagery dates, resolution, band availability, and calculations.
+
+<badge>Phase 6</badge>
+
+### STEP 6 — Expected Crop Yield Estimation
+
+- Select a scientifically appropriate model.
+- Identify required input data.
+- Implement supported calculations.
+- Display yield estimates and uncertainty.
+- Handle insufficient data correctly.
+
+**Completion gate:** Verify model assumptions and ensure results are not presented as guaranteed yields.
+
+<badge>Phase 7</badge>
+
+### STEP 7 — Farmer Action Center
+
+- Integrate results from all completed features.
+- Create priority-based farmer recommendations.
+- Connect dashboard cards to detailed tools.
+- Implement data availability indicators.
+- Ensure there are no duplicate or fabricated results.
+
+**Completion gate:** Verify that the dashboard displays actual feature outputs.
+
+<badge>Final Phase</badge>
+
+### STEP 8 — Complete System Integration and Testing
+
+Test the entire website, including:
+
+- Existing crop recommendation system.
+- Smart Planting Time Advisor.
+- Climate Risk Alert System.
+- Smart Irrigation Advisor.
+- Smart Crop Calendar.
+- Satellite Field Monitoring.
+- Expected Crop Yield Estimation.
+- Farmer Action Center.
+- NASA POWER integration.
+- Data Sources page.
+- Arabic and English switching.
+- Responsive layouts.
+- Navigation.
+- Forms and validation.
+- Charts and interactive elements.
+- API error handling.
+- Loading and empty states.
+
+Check that adding new functionality has not broken existing functionality.
+
+---
+
+# PART 8 — DEVELOPMENT AND TESTING RULES
+
+For every feature:
+
+1. Inspect relevant existing code before modifying it.
+2. Identify all affected files.
+3. Plan the implementation.
+4. Implement the backend logic when required.
+5. Implement the frontend.
+6. Connect the frontend and backend.
+7. Validate inputs.
+8. Handle missing data.
+9. Test normal use cases.
+10. Test failure cases.
+11. Check for regressions.
+12. Update documentation.
+
+Do not skip testing to save time.
+
+Do not claim that a test passed unless it was actually executed.
+
+Use the existing project's technology stack and coding conventions.
+
+Do not create duplicate implementations of existing functionality.
+
+### Important Execution Rule
+
+After completing each phase:
+
+- Record what was implemented.
+- Record files modified.
+- Record tests executed and their actual results.
+- Record known limitations.
+- Fix issues before proceeding.
+
+Then automatically continue to the next phase.
+
+Do not wait for my approval between phases unless an essential external dependency, missing credential, destructive operation, or genuinely blocking decision requires my input.
+
+If a feature is blocked:
+
+1. Explain the exact blocker.
+2. Complete all independent parts that can be implemented safely.
+3. Avoid fake data and fake integrations.
+4. Continue with the next independent feature when possible.
+5. Record the unfinished work for final reporting.
+
+---
+
+# PART 9 — GITHUB-READY FINAL DELIVERABLE
+
+After completing the implementation, prepare a clean version of the entire project.
+
+The final deliverable must include:
+
+- Complete updated source code.
+- Updated README.md.
+- Correct dependency files.
+- `.env.example` without real secrets.
+- Updated API documentation where applicable.
+- Updated data-source documentation.
+- Installation instructions.
+- Development instructions.
+- Testing instructions.
+- Deployment instructions.
+- Database setup or migration instructions when necessary.
+
+Exclude:
+
+- Real `.env` files.
+- API keys and credentials.
+- Private user data.
+- Unnecessary temporary files.
+- Build artifacts that should not be committed.
+- Original `.git` history when preparing a fresh repository archive.
+
+Do not delete necessary project files merely to reduce archive size.
+
+Create a complete ZIP archive ready for GitHub upload.
+
+If possible, also provide a clean GitHub-ready folder structure.
+
+---
+
+# PART 10 — FINAL IMPLEMENTATION REPORT
+
+When all possible implementation phases are complete, provide a structured report.
+
+Include:
+
+## 1. Project Overview
+Summarize the final Field Shift architecture and improvements.
+
+## 2. Feature Implementation Status
+
+Provide a table:
+
+| Feature | Status | Main Implementations | Limitations |
+|---|---|---|---|
+| Smart Planting Time Advisor | | | |
+| Climate Risk Alert System | | | |
+| Smart Irrigation Advisor | | | |
+| Smart Crop Calendar | | | |
+| Satellite Field Monitoring | | | |
+| Expected Crop Yield Estimation | | | |
+| Farmer Action Center | | | |
+
+Use accurate statuses:
+
+- Fully implemented and tested.
+- Partially implemented.
+- Blocked by external dependency.
+- Not implemented.
+
+## 3. Technical Changes
+List important files created or modified.
+
+## 4. Data Integrations
+List actual connected APIs and data sources.
+
+## 5. Scientific Validation
+Explain the models, calculations, references, and assumptions used.
+
+## 6. Testing Results
+List tests actually executed and their results.
+
+## 7. Known Limitations
+Explain all incomplete features and external dependencies.
+
+## 8. GitHub Deliverable
+Provide the final project ZIP and exact instructions for uploading it.
+
+---
+
+# FINAL INSTRUCTIONS
+
+The final objective is to transform Field Shift into a comprehensive, functional, NASA-powered agricultural decision-support platform.
+
+The platform should help farmers in Luxor, Egypt:
+
+- Decide when to plant.
+- Understand climate risks.
+- Manage irrigation.
+- Follow crop growth stages.
+- Monitor vegetation using satellite observations.
+- Understand potential crop yields.
+- Make better agricultural decisions through one unified dashboard.
+
+All seven features are required.
+
+Implement them in the specified sequential order.
+
+Preserve existing functionality.
+
+Prioritize scientific accuracy, reliable data, working integrations, and practical value for farmers over visual appearance alone.
+
+**START NOW WITH STEP 0, INSPECT THE PROJECT, AND THEN CONTINUE THROUGH THE IMPLEMENTATION PHASES IN ORDER.**

@@ -1,0 +1,28 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Optional persistence of farm analyses (the platform works fully without it).
+model SavedAnalysis {
+  id               String   @id @default(cuid())
+  createdAt        DateTime @default(now())
+  lat              Float
+  lng              Float
+  label            String
+  soilType         String
+  waterAvailability String
+  season           String
+  bestCrop         String
+  bestCropEn       String
+  bestCropAr       String
+  bestScore        Int
+  resultJson       String
+}

@@ -1,0 +1,799 @@
+     1→/**
+     2→ * AgriWise crop suitability engine.
+     3→ *
+     4→ * Transparent weighted scoring (0-100 per crop):
+     5→ *   temperature 30 · water 20 · solar 15 · soil 15 · season 10 · humidity 5 · wind 5
+     6→ *
+     7→ * Every factor produces an explainable, bilingual justification built from the
+     8→ * actual NASA monthly climatology and the farmer's own inputs. When a factor's
+     9→ * data is unavailable (e.g. soil type "unknown" or a missing NASA parameter),
+    10→ * the factor is marked unavailable, its weight is redistributed across the
+    11→ * remaining factors, and the analysis confidence is lowered — no value is ever
+    12→ * assumed. Scores are decision support only; they do not guarantee yield or
+    13→ * profitability.
+    14→ */
+    15→
+    16→import { CROPS, type CropRecord } from "./crops";
+    17→import {
+    18→  FACTOR_LABELS,
+    19→  SEASON_LABELS,
+    20→  SOIL_LABELS,
+    21→  WATER_LABELS,
+    22→} from "./labels";
+    23→import {
+    24→  L,
+    25→  MONTHS_AR,
+    26→  MONTHS_EN,
+    27→  SEASON_PLANTING_MONTHS,
+    28→  type Bilingual,
+    29→  type CropResult,
+    30→  type EngineInfo,
+    31→  type FactorKey,
+    32→  type FactorScore,
+    33→  type FarmInput,
+    34→  type MonthlyValue,
+    35→  type ClimateSummary,
+    36→} from "./types";
+    37→
+    38→/* ---------------- helpers ---------------- */
+    39→
+    40→const clamp = (v: number, lo = 0, hi = 100) => Math.min(hi, Math.max(lo, v));
+    41→const round1 = (v: number) => Math.round(v * 10) / 10;
+    42→
+    43→/**
+    44→ * Piecewise suitability: 0 at/beyond absolute limits, 100 inside the optimum,
+    45→ * linear ramps between limit and optimum (10 pts at the absolute limit).
+    46→ */
+    47→export function rangeFit(
+    48→  v: number,
+    49→  absMin: number,
+    50→  optMin: number,
+    51→  optMax: number,
+    52→  absMax: number
+    53→): number {
+    54→  if (v <= absMin || v >= absMax) return 0;
+    55→  if (v < optMin) return 10 + (90 * (v - absMin)) / (optMin - absMin);
+    56→  if (v > optMax) return 100 - (90 * (v - optMax)) / (absMax - optMax);
+    57→  return 100;
+    58→}
+    59→
+    60→const monthRangeLabel = (months: number[]): Bilingual => {
+    61→  if (months.length === 0) return L("the growing window", "فترة النمو");
+    62→  const fmt = (m: number) => MONTHS_EN[m - 1];
+    63→  const fmtAr = (m: number) => MONTHS_AR[m - 1];
+    64→  const start = months[0];
+    65→  const end = months[months.length - 1];
+    66→  if (months.length === 1) return L(fmt(start), fmtAr(start));
+    67→  return L(`${fmt(start)}–${fmt(end)}`, `${fmtAr(start)}–${fmtAr(end)}`);
+    68→};
+    69→
+    70→const BASE_WEIGHTS: Record<FactorKey, number> = {
+    71→  temperature: 30,
+    72→  water: 20,
+    73→  solar: 15,
+    74→  soil: 15,
+    75→  season: 10,
+    76→  humidity: 5,
+    77→  wind: 5,
+    78→};
+    79→
+    80→const FACTOR_ORDER: FactorKey[] = [
+    81→  "temperature",
+    82→  "water",
+    83→  "solar",
+    84→  "soil",
+    85→  "season",
+    86→  "humidity",
+    87→  "wind",
+    88→];
+    89→
+    90→/* ---------------- window selection ---------------- */
+    91→
+    92→/** Growing window: planting month inside the farmer's season when possible,
+    93→ *  otherwise the crop's primary documented planting month. */
+    94→function pickWindow(
+    95→  crop: CropRecord,
+    96→  userSeason: FarmInput["season"]
+    97→): { startMonth: number; months: number[] } {
+    98→  const seasonMonths = SEASON_PLANTING_MONTHS[userSeason];
+    99→  const inSeason = crop.plantingMonths.find((m) => seasonMonths.includes(m));
+   100→  const start = inSeason ?? crop.plantingMonths[0];
+   101→  const midDuration =
+   102→    (crop.durationDays[0] + crop.durationDays[1]) / 2;
+   103→  const len = Math.max(2, Math.round(midDuration / 30));
+   104→  const months = Array.from(
+   105→    { length: len },
+   106→    (_, i) => ((start - 1 + i) % 12) + 1
+   107→  );
+   108→  return { startMonth: start, months };
+   109→}
+   110→
+   111→/* ---------------- factor scorers ---------------- */
+   112→
+   113→interface Ctx {
+   114→  monthly: MonthlyValue[];
+   115→  farm: FarmInput;
+   116→}
+   117→
+   118→function windowMean(
+   119→  monthly: MonthlyValue[],
+   120→  months: number[],
+   121→  key: "t2m" | "t2mMax" | "t2mMin" | "rh2m" | "solar" | "ws10m"
+   122→): number | null {
+   123→  const vals = months
+   124→    .map((m) => monthly[m - 1]?.[key])
+   125→    .filter((v): v is number => v !== null && v !== undefined);
+   126→  if (vals.length === 0) return null;
+   127→  return vals.reduce((a, b) => a + b, 0) / vals.length;
+   128→}
+   129→
+   130→function windowRain(monthly: MonthlyValue[], months: number[]): number | null {
+   131→  const vals = months
+   132→    .map((m) => monthly[m - 1]?.precip)
+   133→    .filter((v): v is number => v !== null && v !== undefined);
+   134→  if (vals.length === 0) return null;
+   135→  return vals.reduce((a, b) => a + b, 0);
+   136→}
+   137→
+   138→function scoreTemperature(
+   139→  ctx: Ctx,
+   140→  crop: CropRecord,
+   141→  months: number[]
+   142→): FactorScore {
+   143→  const range = monthRangeLabel(months);
+   144→  const reasons: Bilingual[] = [];
+   145→  const limitations: Bilingual[] = [];
+   146→
+   147→  const meanT = windowMean(ctx.monthly, months, "t2m");
+   148→  if (meanT === null) {
+   149→    return {
+   150→      key: "temperature",
+   151→      weight: BASE_WEIGHTS.temperature,
+   152→      effectiveWeight: BASE_WEIGHTS.temperature,
+   153→      score: null,
+   154→      status: "unavailable",
+   155→      reasons: [],
+   156→      limitations: [
+   157→        L(
+   158→          "NASA POWER temperature data unavailable for this location/period.",
+   159→          "بيانات درجات الحرارة من NASA POWER غير متاحة لهذا الموقع/الفترة."
+   160→        ),
+   161→      ],
+   162→    };
+   163→  }
+   164→
+   165→  const fits = months.map((m) => {
+   166→    const t = ctx.monthly[m - 1]?.t2m;
+   167→    return t === null || t === undefined
+   168→      ? null
+   169→      : rangeFit(t, crop.temp.absMin, crop.temp.optMin, crop.temp.optMax, crop.temp.absMax);
+   170→  });
+   171→  const validFits = fits.filter((f): f is number => f !== null);
+   172→  const meanFit = validFits.length
+   173→    ? validFits.reduce((a, b) => a + b, 0) / validFits.length
+   174→    : 0;
+   175→
+   176→  // heat & cold stress from monthly mean maxima/minima
+   177→  // 5 penalty points per °C beyond the tolerance, per affected month
+   178→  let heatPenalty = 0;
+   179→  let coldPenalty = 0;
+   180→  for (const m of months) {
+   181→    const mv = ctx.monthly[m - 1];
+   182→    if (!mv) continue;
+   183→    if (mv.t2mMax !== null && mv.t2mMax > crop.temp.absMax) {
+   184→      heatPenalty += (mv.t2mMax - crop.temp.absMax) * 5;
+   185→      limitations.push(
+   186→        L(
+   187→          `Daytime maxima in ${MONTHS_EN[m - 1]} average ${round1(mv.t2mMax)}°C, above the ${crop.temp.absMax}°C tolerance limit — heat stress expected.`,
+   188→          `متوسط الحرارة القصوى نهارًا في ${MONTHS_AR[m - 1]} ${round1(mv.t2mMax)}°م، أعلى من حد التحمل ${crop.temp.absMax}°م — يُتوقع إجهاد حراري.`
+   189→        )
+   190→      );
+   191→    }
+   192→    if (mv.t2mMin !== null && mv.t2mMin < crop.temp.absMin) {
+   193→      coldPenalty += (crop.temp.absMin - mv.t2mMin) * 5;
+   194→      limitations.push(
+   195→        L(
+   196→          `Night minima in ${MONTHS_EN[m - 1]} average ${round1(mv.t2mMin)}°C, below the ${crop.temp.absMin}°C minimum — cold stress expected.`,
+   197→          `متوسط الحرارة الدنيا ليلًا في ${MONTHS_AR[m - 1]} ${round1(mv.t2mMin)}°م، أقل من الحد الأدنى ${crop.temp.absMin}°م — يُتوقع إجهاد بارد.`
+   198→        )
+   199→      );
+   200→    }
+   201→  }
+   202→
+   203→  const score = clamp(meanFit - heatPenalty - coldPenalty);
+   204→
+   205→  if (meanT >= crop.temp.optMin && meanT <= crop.temp.optMax) {
+   206→    reasons.push(
+   207→      L(
+   208→        `Mean temperature during ${range.en} is ${round1(meanT)}°C — inside the documented optimum of ${crop.temp.optMin}–${crop.temp.optMax}°C.`,
+   209→        `متوسط الحرارة خلال ${range.ar} هو ${round1(meanT)}°م — داخل المدى الأمثل الموثق ${crop.temp.optMin}–${crop.temp.optMax}°م.`
+   210→      )
+   211→    );
+   212→  } else if (meanT > crop.temp.optMax && meanT < crop.temp.absMax) {
+   213→    reasons.push(
+   214→      L(
+   215→        `Mean temperature during ${range.en} is ${round1(meanT)}°C — above the ${crop.temp.optMin}–${crop.temp.optMax}°C optimum but within tolerance.`,
+   216→        `متوسط الحرارة خلال ${range.ar} هو ${round1(meanT)}°م — أعلى من المدى الأمثل ${crop.temp.optMin}–${crop.temp.optMax}°م لكنه داخل حد التحمل.`
+   217→      )
+   218→    );
+   219→    limitations.push(
+   220→      L(
+   221→        `Temperatures run warmer than the documented optimum for most of the window.`,
+   222→        `الحرارة أعلى من المدى الأمثل الموثق خلال معظم الفترة.`
+   223→      )
+   224→    );
+   225→  } else if (meanT < crop.temp.optMin && meanT > crop.temp.absMin) {
+   226→    reasons.push(
+   227→      L(
+   228→        `Mean temperature during ${range.en} is ${round1(meanT)}°C — below the ${crop.temp.optMin}–${crop.temp.optMax}°C optimum but within tolerance.`,
+   229→        `متوسط الحرارة خلال ${range.ar} هو ${round1(meanT)}°م — أقل من المدى الأمثل ${crop.temp.optMin}–${crop.temp.optMax}°م لكنه داخل حد التحمل.`
+   230→      )
+   231→    );
+   232→    limitations.push(
+   233→      L(
+   234→        `Temperatures run cooler than the documented optimum for most of the window.`,
+   235→        `الحرارة أقل من المدى الأمثل الموثق خلال معظم الفترة.`
+   236→      )
+   237→    );
+   238→  } else {
+   239→    limitations.push(
+   240→      L(
+   241→        `Mean temperature during ${range.en} (${round1(meanT)}°C) is outside the crop's documented tolerance range of ${crop.temp.absMin}–${crop.temp.absMax}°C.`,
+   242→        `متوسط الحرارة خلال ${range.ar} (${round1(meanT)}°م) خارج مدى التحمل الموثق للمحصول ${crop.temp.absMin}–${crop.temp.absMax}°م.`
+   243→      )
+   244→    );
+   245→  }
+   246→
+   247→  return {
+   248→    key: "temperature",
+   249→    weight: BASE_WEIGHTS.temperature,
+   250→    effectiveWeight: BASE_WEIGHTS.temperature,
+   251→    score,
+   252→    status: heatPenalty + coldPenalty > 15 ? "limited" : "ok",
+   253→    reasons,
+   254→    limitations,
+   255→  };
+   256→}
+   257→
+   258→const WATER_SUPPLY: Record<
+   259→  CropRecord["water"]["category"],
+   260→  Record<FarmInput["waterAvailability"], number>
+   261→> = {
+   262→  low: { limited: 70, moderate: 95, abundant: 100 },
+   263→  medium: { limited: 45, moderate: 80, abundant: 100 },
+   264→  high: { limited: 25, moderate: 60, abundant: 95 },
+   265→  "very-high": { limited: 10, moderate: 40, abundant: 85 },
+   266→};
+   267→
+   268→function scoreWater(
+   269→  ctx: Ctx,
+   270→  crop: CropRecord,
+   271→  months: number[]
+   272→): { factor: FactorScore; gap: number | null } {
+   273→  const reasons: Bilingual[] = [];
+   274→  const limitations: Bilingual[] = [];
+   275→  const [needMin, needMax] = crop.water.seasonNeedMm;
+   276→  const needMid = (needMin + needMax) / 2;
+   277→  const rain = windowRain(ctx.monthly, months);
+   278→  const effRain = rain === null ? 0 : rain;
+   279→  const gap = Math.max(0, needMid - effRain);
+   280→  const waterLabel = WATER_LABELS[ctx.farm.waterAvailability];
+   281→
+   282→  reasons.push(
+   283→    L(
+   284→      `Documented seasonal water requirement: ${needMin}–${needMax} mm per cycle.`,
+   285→      `الاحتياج المائي الموسمي الموثق: ${needMin}–${needMax} مم لكل دورة.`
+   286→    )
+   287→  );
+   288→
+   289→  if (rain !== null) {
+   290→    reasons.push(
+   291→      L(
+   292→        `Local rainfall during the growing window contributes only about ${round1(effRain)} mm; irrigation must supply the remaining ≈${Math.round(gap)} mm.`,
+   293→        `أمطار المنطقة خلال فترة النمو تسهم بنحو ${round1(effRain)} مم فقط؛ وعلى الري تأمين الباقي ≈${Math.round(gap)} مم.`
+   294→      )
+   295→    );
+   296→  } else {
+   297→    reasons.push(
+   298→      L(
+   299→        "NASA rainfall data unavailable for this window; irrigation requirement estimated from crop needs only.",
+   300→        "بيانات الأمطار غير متاحة لهذه الفترة؛ قُدِّر الاحتياج من الري وفق احتياج المحصول فقط."
+   301→      )
+   302→    );
+   303→  }
+   304→
+   305→  const supply = WATER_SUPPLY[crop.water.category][ctx.farm.waterAvailability];
+   306→  const rainBonus = rain === null ? 0 : Math.min(10, effRain / 20);
+   307→  const score = clamp(supply + rainBonus);
+   308→
+   309→  if (ctx.farm.waterAvailability === "abundant") {
+   310→    reasons.push(
+   311→      L(
+   312→        `Your reported water availability (${waterLabel.en}) can cover this crop's demand.`,
+   313→        `توفر المياه الذي ذكرته (${waterLabel.ar}) يمكنه تغطية احتياج هذا المحصول.`
+   314→      )
+   315→    );
+   316→  } else if (ctx.farm.waterAvailability === "moderate") {
+   317→    if (crop.water.category === "high" || crop.water.category === "very-high") {
+   318→      limitations.push(
+   319→        L(
+   320→          `Moderate water availability is tight for a ${crop.water.category === "very-high" ? "very-high" : "high"} requirement crop — plan irrigation carefully.`,
+   321→          `التوفر المتوسط للمياه ضيّق لمحصول ذي احتياج ${crop.water.category === "very-high" ? "مرتفع جدًا" : "مرتفع"} — خطّط للري بعناية.`
+   322→        )
+   323→      );
+   324→    } else {
+   325→      reasons.push(
+   326→        L(
+   327→          `Your reported water availability (${waterLabel.en}) is adequate for this requirement level.`,
+   328→          `توفر المياه الذي ذكرته (${waterLabel.ar}) كافٍ لمستوى هذا الاحتياج.`
+   329→        )
+   330→      );
+   331→    }
+   332→  } else {
+   333→    limitations.push(
+   334→      L(
+   335→        `Limited water availability is a major constraint for this crop (documented need ${needMin}–${needMax} mm).`,
+   336→        `محدودية المياه قيد رئيسي لهذا المحصول (الاحتياج الموثق ${needMin}–${needMax} مم).`
+   337→      )
+   338→    );
+   339→  }
+   340→
+   341→  return {
+   342→    factor: {
+   343→      key: "water",
+   344→      weight: BASE_WEIGHTS.water,
+   345→      effectiveWeight: BASE_WEIGHTS.water,
+   346→      score,
+   347→      status: score < 45 ? "limited" : "ok",
+   348→      reasons,
+   349→      limitations,
+   350→    },
+   351→    gap: rain === null ? null : gap,
+   352→  };
+   353→}
+   354→
+   355→function scoreSolar(
+   356→  ctx: Ctx,
+   357→  crop: CropRecord,
+   358→  months: number[]
+   359→): FactorScore {
+   360→  const reasons: Bilingual[] = [];
+   361→  const limitations: Bilingual[] = [];
+   362→  const s = windowMean(ctx.monthly, months, "solar");
+   363→  if (s === null) {
+   364→    return {
+   365→      key: "solar",
+   366→      weight: BASE_WEIGHTS.solar,
+   367→      effectiveWeight: BASE_WEIGHTS.solar,
+   368→      score: null,
+   369→      status: "unavailable",
+   370→      reasons: [],
+   371→      limitations: [
+   372→        L(
+   373→          "NASA solar radiation data unavailable for this location/period.",
+   374→          "بيانات الإشعاع الشمسي من NASA POWER غير متاحة لهذا الموقع/الفترة."
+   375→        ),
+   376→      ],
+   377→    };
+   378→  }
+   379→  const absMin = crop.solar.optMin - 2;
+   380→  const absMax = crop.solar.optMax + 2;
+   381→  const score = clamp(rangeFit(s, absMin, crop.solar.optMin, crop.solar.optMax, absMax));
+   382→  if (s >= crop.solar.optMin && s <= crop.solar.optMax) {
+   383→    reasons.push(
+   384→      L(
+   385→        `Average solar radiation of ${round1(s)} kWh/m²/day during the window is inside the documented optimum of ${crop.solar.optMin}–${crop.solar.optMax}.`,
+   386→        `متوسط الإشعاع الشمسي ${round1(s)} كيلوواط·س/م²/يوم خلال الفترة داخل المدى الأمثل الموثق ${crop.solar.optMin}–${crop.solar.optMax}.`
+   387→      )
+   388→    );
+   389→  } else if (s < crop.solar.optMin) {
+   390→    limitations.push(
+   391→      L(
+   392→        `Average solar radiation of ${round1(s)} kWh/m²/day is below the documented optimum of ${crop.solar.optMin}–${crop.solar.optMax}.`,
+   393→        `متوسط الإشعاع الشمسي ${round1(s)} كيلوواط·س/م²/يوم أقل من المدى الأمثل الموثق ${crop.solar.optMin}–${crop.solar.optMax}.`
+   394→      )
+   395→    );
+   396→  } else {
+   397→    limitations.push(
+   398→      L(
+   399→        `Average solar radiation of ${round1(s)} kWh/m²/day exceeds the documented optimum of ${crop.solar.optMin}–${crop.solar.optMax} (higher evaporation and heat load).`,
+   400→        `متوسط الإشعاع الشمسي ${round1(s)} كيلوواط·س/م²/يوم أعلى من المدى الأمثل الموثق ${crop.solar.optMin}–${crop.solar.optMax} (تبخّر وحِمل حراري أعلى).`
+   401→      )
+   402→    );
+   403→  }
+   404→  return {
+   405→    key: "solar",
+   406→    weight: BASE_WEIGHTS.solar,
+   407→    effectiveWeight: BASE_WEIGHTS.solar,
+   408→    score,
+   409→    status: "ok",
+   410→    reasons,
+   411→    limitations,
+   412→  };
+   413→}
+   414→
+   415→function scoreSoil(ctx: Ctx, crop: CropRecord): FactorScore {
+   416→  const soil = ctx.farm.soilType;
+   417→  const label = SOIL_LABELS[soil];
+   418→  if (soil === "unknown") {
+   419→    return {
+   420→      key: "soil",
+   421→      weight: BASE_WEIGHTS.soil,
+   422→      effectiveWeight: BASE_WEIGHTS.soil,
+   423→      score: null,
+   424→      status: "unavailable",
+   425→      reasons: [],
+   426→      limitations: [
+   427→        L(
+   428→          "Soil type was not provided — this factor is excluded and its weight redistributed. The final score is less certain.",
+   429→          "لم يُحدَّد نوع التربة — استُبعد هذا العامل وأُعيد توزيع وزنه، فدرجة الملاءمة النهائية أقل يقينًا."
+   430→        ),
+   431→      ],
+   432→    };
+   433→  }
+   434→  const match =
+   435→    soil === "other" ? 50 : (crop.soil[soil as "clay" | "sandy" | "loam"] ?? 40);
+   436→  const reasons: Bilingual[] = [];
+   437→  const limitations: Bilingual[] = [];
+   438→  if (soil === "other") {
+   439→    limitations.push(
+   440→      L(
+   441→        "Soil reported as “other”: a generic compatibility of 50/100 is assumed — verify with your local agricultural extension office.",
+   442→        "التربة المُبلغ عنها «أخرى»: افترضنا ملاءمة عامة 50/100 — يُرجى التحقق من مكتب الإرشاد الزراعي المحلي."
+   443→      )
+   444→    );
+   445→  } else if (match >= 85) {
+   446→    reasons.push(
+   447→      L(
+   448→        `${label.en} matches the crop's documented soil preference well (${match}/100).`,
+   449→        `${label.ar} تناسب تمامًا تفضيل التربة الموثق للمحصول (${match}/100).`
+   450→      )
+   451→    );
+   452→  } else if (match >= 60) {
+   453→    reasons.push(
+   454→      L(
+   455→        `${label.en} is acceptable for this crop (${match}/100 compatibility).`,
+   456→        `${label.ar} مقبولة لهذا المحصول (ملاءمة ${match}/100).`
+   457→      )
+   458→    );
+   459→  } else {
+   460→    limitations.push(
+   461→      L(
+   462→        `${label.en} is a weak match for this crop (${match}/100).`,
+   463→        `${label.ar} ملاءمة ضعيفة لهذا المحصول (${match}/100).`
+   464→      )
+   465→    );
+   466→  }
+   467→  reasons.push(crop.soilNote);
+   468→  return {
+   469→    key: "soil",
+   470→    weight: BASE_WEIGHTS.soil,
+   471→    effectiveWeight: BASE_WEIGHTS.soil,
+   472→    score: match,
+   473→    status: match < 60 ? "limited" : "ok",
+   474→    reasons,
+   475→    limitations,
+   476→  };
+   477→}
+   478→
+   479→function scoreSeason(ctx: Ctx, crop: CropRecord): FactorScore {
+   480→  const userSeason = ctx.farm.season;
+   481→  const seasonLabel = SEASON_LABELS[userSeason];
+   482→  const planting = crop.plantingMonths;
+   483→  const plantingLabel = L(
+   484→    planting.map((m) => MONTHS_EN[m - 1]).join(", "),
+   485→    planting.map((m) => MONTHS_AR[m - 1]).join("، ")
+   486→  );
+   487→  const match = crop.seasons.includes(userSeason);
+   488→  if (match) {
+   489→    return {
+   490→      key: "season",
+   491→      weight: BASE_WEIGHTS.season,
+   492→      effectiveWeight: BASE_WEIGHTS.season,
+   493→      score: 100,
+   494→      status: "ok",
+   495→      reasons: [
+   496→        L(
+   497→          `Your ${seasonLabel.en} planting season matches the documented Egyptian calendar for this crop (${plantingLabel.en}).`,
+   498→          `موسم الزراعة ${seasonLabel.ar} الذي اخترته يطابق التقويم المصري الموثق لهذا المحصول (${plantingLabel.ar}).`
+   499→        ),
+   500→      ],
+   501→      limitations: [],
+   502→    };
+   503→  }
+   504→  return {
+   505→    key: "season",
+   506→    weight: BASE_WEIGHTS.season,
+   507→    effectiveWeight: BASE_WEIGHTS.season,
+   508→    score: 25,
+   509→    status: "limited",
+   510→    reasons: [],
+   511→    limitations: [
+   512→      L(
+   513→        `You selected the ${seasonLabel.en} season, but this crop is planted in ${plantingLabel.en} in Egypt.`,
+   514→        `اخترت الموسم ${seasonLabel.ar}، بينما يُزرع هذا المحصول في ${plantingLabel.ar} في مصر.`
+   515→      ),
+   516→    ],
+   517→  };
+   518→}
+   519→
+   520→function scoreHumidity(
+   521→  ctx: Ctx,
+   522→  crop: CropRecord,
+   523→  months: number[]
+   524→): FactorScore {
+   525→  const rh = windowMean(ctx.monthly, months, "rh2m");
+   526→  if (rh === null) {
+   527→    return {
+   528→      key: "humidity",
+   529→      weight: BASE_WEIGHTS.humidity,
+   530→      effectiveWeight: BASE_WEIGHTS.humidity,
+   531→      score: null,
+   532→      status: "unavailable",
+   533→      reasons: [],
+   534→      limitations: [
+   535→        L(
+   536→          "NASA relative humidity data unavailable for this location/period.",
+   537→          "بيانات الرطوبة النسبية من NASA POWER غير متاحة لهذا الموقع/الفترة."
+   538→        ),
+   539→      ],
+   540→    };
+   541→  }
+   542→  const absMin = crop.humidity.optMin - 15;
+   543→  const absMax = crop.humidity.optMax + 15;
+   544→  const score = clamp(
+   545→    rangeFit(rh, absMin, crop.humidity.optMin, crop.humidity.optMax, absMax)
+   546→  );
+   547→  const reasons: Bilingual[] = [];
+   548→  const limitations: Bilingual[] = [];
+   549→  if (rh > crop.humidity.optMax) {
+   550→    limitations.push(
+   551→      L(
+   552→        `Mean relative humidity of ${Math.round(rh)}% exceeds the documented comfort range (up to ${crop.humidity.optMax}%) — foliar disease pressure rises.`,
+   553→        `متوسط الرطوبة النسبية ${Math.round(rh)}% يتجاوز مدى الراحة الموثق (حتى ${crop.humidity.optMax}%) — يرتفع ضغط أمراض المجموع الخضري.`
+   554→      )
+   555→    );
+   556→  } else if (rh < crop.humidity.optMin) {
+   557→    limitations.push(
+   558→      L(
+   559→        `Mean relative humidity of ${Math.round(rh)}% is below the documented range (from ${crop.humidity.optMin}%) — dry-air stress.`,
+   560→        `متوسط الرطوبة النسبية ${Math.round(rh)}% أقل من المدى الموثق (من ${crop.humidity.optMin}%) — إجهاد جفاف الهواء.`
+   561→      )
+   562→    );
+   563→  } else {
+   564→    reasons.push(
+   565→      L(
+   566→        `Mean relative humidity of ${Math.round(rh)}% during the window is inside the documented range of ${crop.humidity.optMin}–${crop.humidity.optMax}%.`,
+   567→        `متوسط الرطوبة النسبية ${Math.round(rh)}% خلال الفترة داخل المدى الموثق ${crop.humidity.optMin}–${crop.humidity.optMax}%.`
+   568→      )
+   569→    );
+   570→  }
+   571→  return {
+   572→    key: "humidity",
+   573→    weight: BASE_WEIGHTS.humidity,
+   574→    effectiveWeight: BASE_WEIGHTS.humidity,
+   575→    score,
+   576→    status: "ok",
+   577→    reasons,
+   578→    limitations,
+   579→  };
+   580→}
+   581→
+   582→function scoreWind(ctx: Ctx, crop: CropRecord, months: number[]): FactorScore {
+   583→  const w = windowMean(ctx.monthly, months, "ws10m");
+   584→  if (w === null) {
+   585→    return {
+   586→      key: "wind",
+   587→      weight: BASE_WEIGHTS.wind,
+   588→      effectiveWeight: BASE_WEIGHTS.wind,
+   589→      score: null,
+   590→      status: "unavailable",
+   591→      reasons: [],
+   592→      limitations: [
+   593→        L(
+   594→          "NASA wind speed data unavailable for this location/period.",
+   595→          "بيانات سرعة الرياح من NASA POWER غير متاحة لهذا الموقع/الفترة."
+   596→        ),
+   597→      ],
+   598→    };
+   599→  }
+   600→  const tol = crop.windTolerance;
+   601→  const score = w <= tol ? 100 : clamp(100 - 15 * (w - tol), 30, 100);
+   602→  const reasons: Bilingual[] = [];
+   603→  const limitations: Bilingual[] = [];
+   604→  if (w <= tol) {
+   605→    reasons.push(
+   606→      L(
+   607→        `Mean wind speed of ${round1(w)} m/s is below the ≈${tol} m/s problem threshold for this crop.`,
+   608→        `متوسط سرعة الرياح ${round1(w)} م/ث أقل من عتبة المشاكل ≈${tol} م/ث لهذا المحصول.`
+   609→      )
+   610→    );
+   611→  } else {
+   612→    limitations.push(
+   613→      L(
+   614→        `Mean wind speed of ${round1(w)} m/s exceeds the ≈${tol} m/s threshold — higher lodging, evaporation and mechanical damage risk.`,
+   615→        `متوسط سرعة الرياح ${round1(w)} م/ث يتجاوز عتبة ≈${tol} م/ث — ارتفاع خطر الرقود والتبخر والتلف الميكانيكي.`
+   616→      )
+   617→    );
+   618→  }
+   619→  return {
+   620→    key: "wind",
+   621→    weight: BASE_WEIGHTS.wind,
+   622→    effectiveWeight: BASE_WEIGHTS.wind,
+   623→    score,
+   624→    status: score < 100 ? "limited" : "ok",
+   625→    reasons,
+   626→    limitations,
+   627→  };
+   628→}
+   629→
+   630→/* ---------------- classification & summary ---------------- */
+   631→
+   632→export function classify(score: number): Bilingual {
+   633→  if (score >= 80) return L("Highly suitable", "ملائم جدًا");
+   634→  if (score >= 65) return L("Suitable", "ملائم");
+   635→  if (score >= 50) return L("Moderately suitable", "ملائم بشكل متوسط");
+   636→  if (score >= 35) return L("Marginally suitable", "ملاءمة محدودة");
+   637→  return L("Not recommended", "غير موصى به");
+   638→}
+   639→
+   640→function buildSummary(
+   641→  crop: CropRecord,
+   642→  factors: FactorScore[],
+   643→  seasonMatch: boolean
+   644→): Bilingual {
+   645→  const positives = factors
+   646→    .filter((f) => f.score !== null && f.score >= 70 && f.reasons.length > 0)
+   647→    .sort((a, b) => b.effectiveWeight - a.effectiveWeight);
+   648→  const negatives = factors
+   649→    .filter((f) => f.score !== null && f.score < 50 && f.limitations.length > 0)
+   650→    .sort((a, b) => b.effectiveWeight - a.effectiveWeight);
+   651→
+   652→  const posEn = positives.slice(0, 2).map((f) => f.reasons[0].en);
+   653→  const posAr = positives.slice(0, 2).map((f) => f.reasons[0].ar);
+   654→  const negEn = negatives[0]?.limitations[0]?.en;
+   655→  const negAr = negatives[0]?.limitations[0]?.ar;
+   656→
+   657→  let en = `We recommend growing ${crop.name.en} because `;
+   658→  let ar = `نوصي بزراعة ${crop.name.ar} لأن `;
+   659→  if (posEn.length === 0) {
+   660→    en += "no factor strongly favors it under the current conditions";
+   661→    ar += "لا يوجد عامل قوي يرجّحه في الظروف الحالية";
+   662→  } else {
+   663→    en += posEn.join(", and ");
+   664→    ar += posAr.join("، و");
+   665→  }
+   666→  en += ".";
+   667→  ar += ".";
+   668→  if (negEn) {
+   669→    en += ` Main limitation: ${negEn}`;
+   670→    ar += ` القيد الرئيسي: ${negAr}`;
+   671→  }
+   672→  if (!seasonMatch) {
+   673→    const pl = L(
+   674→      crop.plantingMonths.map((m) => MONTHS_EN[m - 1]).join(", "),
+   675→      crop.plantingMonths.map((m) => MONTHS_AR[m - 1]).join("، ")
+   676→    );
+   677→    en += ` Note: in Egypt this crop is planted around ${pl.en}, not in your selected season — treat it as planning information for another season.`;
+   678→    ar += ` ملاحظة: يُزرع هذا المحصول في مصر حول ${pl.ar} وليس في الموسم الذي اخترته — تعامَل معه كمعلومة تخطيط لموسم آخر.`;
+   679→  }
+   680→  return L(en, ar);
+   681→}
+   682→
+   683→/* ---------------- main entry ---------------- */
+   684→
+   685→export function runEngine(
+   686→  monthly: MonthlyValue[],
+   687→  climateSummary: ClimateSummary,
+   688→  farm: FarmInput
+   689→): { crops: CropResult[]; engine: EngineInfo } {
+   690→  const ctx: Ctx = { monthly, farm };
+   691→  const results: CropResult[] = [];
+   692→
+   693→  for (const crop of CROPS) {
+   694→    const { months } = pickWindow(crop, farm.season);
+   695→    const seasonMatch = crop.seasons.includes(farm.season);
+   696→
+   697→    const temperature = scoreTemperature(ctx, crop, months);
+   698→    const { factor: water, gap } = scoreWater(ctx, crop, months);
+   699→    const solar = scoreSolar(ctx, crop, months);
+   700→    const soil = scoreSoil(ctx, crop);
+   701→    const season = scoreSeason(ctx, crop);
+   702→    const humidity = scoreHumidity(ctx, crop, months);
+   703→    const wind = scoreWind(ctx, crop, months);
+   704→
+   705→    const factors = [temperature, water, solar, soil, season, humidity, wind];
+   706→
+   707→    // redistribute weight of unavailable factors
+   708→    const available = factors.filter((f) => f.score !== null);
+   709→    const totalBase = available.reduce((a, f) => a + f.weight, 0);
+   710→    for (const f of factors) {
+   711→      f.effectiveWeight =
+   712→        f.score === null ? 0 : Math.round((f.weight / totalBase) * 1000) / 10;
+   713→    }
+   714→
+   715→    const score =
+   716→      available.length === 0
+   717→        ? 0
+   718→        : Math.round(
+   719→            available.reduce((a, f) => a + (f.score as number) * f.weight, 0) /
+   720→              totalBase
+   721→          );
+   722→
+   723→    results.push({
+   724→      cropId: crop.id,
+   725→      score,
+   726→      classification: classify(score),
+   727→      rank: 0,
+   728→      seasonMatch,
+   729→      factors,
+   730→      windowMonths: months,
+   731→      irrigationGapMm: gap,
+   732→      summary: buildSummary(crop, factors, seasonMatch),
+   733→    });
+   734→  }
+   735→
+   736→  // Crops plantable in the farmer's selected season rank first,
+   737→  // then off-season crops (clearly labeled in the UI as planning info).
+   738→  results.sort((a, b) =>
+   739→    a.seasonMatch === b.seasonMatch ? b.score - a.score : a.seasonMatch ? -1 : 1
+   740→  );
+   741→  results.forEach((r, i) => (r.rank = i + 1));
+   742→
+   743→  // confidence
+   744→  const unavailableClimate = results[0]?.factors.filter(
+   745→    (f) => f.status === "unavailable" && f.key !== "soil"
+   746→  );
+   747→  const soilUnknown = farm.soilType === "unknown";
+   748→  const coverage = climateSummary.coverageOverall;
+   749→  let confidence: EngineInfo["confidence"] = "high";
+   750→  const notes: Bilingual[] = [];
+   751→  if (coverage < 0.85) {
+   752→    confidence = "low";
+   753→    notes.push(
+   754→      L(
+   755→        `NASA data coverage for the analyzed period is only ${Math.round(coverage * 100)}%.`,
+   756→        `تغطية بيانات NASA للفترة المحللة ${Math.round(coverage * 100)}% فقط.`
+   757→      )
+   758→    );
+   759→  } else if (coverage < 0.95 || soilUnknown || (unavailableClimate?.length ?? 0) > 0) {
+   760→    confidence = "medium";
+   761→  }
+   762→  if (soilUnknown) {
+   763→    notes.push(
+   764→      L(
+   765→        "Soil type was not provided, so the soil factor was excluded from scoring.",
+   766→        "لم يُحدَّد نوع التربة، لذا استُبعد عامل التربة من التقييم."
+   767→      )
+   768→    );
+   769→  }
+   770→  if ((unavailableClimate?.length ?? 0) > 0) {
+   771→    notes.push(
+   772→      L(
+   773→        "Some NASA parameters were unavailable and their factors were excluded.",
+   774→        "بعض متغيرات NASA لم تكن متاحة واستُبعدت عواملها."
+   775→      )
+   776→    );
+   777→  }
+   778→  if (notes.length === 0) {
+   779→    notes.push(
+   780→      L(
+   781→        "All factors were evaluated with complete NASA POWER data and farm inputs.",
+   782→        "قُيِّمت جميع العوامل ببيانات NASA POWER كاملة ومدخلات المزرعة."
+   783→      )
+   784→    );
+   785→  }
+   786→
+   787→  const engine: EngineInfo = {
+   788→    weights: FACTOR_ORDER.map((key) => ({ key, weight: BASE_WEIGHTS[key] })),
+   789→    methodology: L(
+   790→      "Each factor is scored 0-100 by comparing NASA POWER monthly climatology and your farm inputs with the documented requirements of each crop (FAO EcoCrop, FAO I&D Paper 33, Egyptian MALR extension data). The final score is the weighted average: temperature 30%, water 20%, solar radiation 15%, soil 15%, season 10%, humidity 5%, wind 5%. Unavailable factors are excluded and their weight redistributed. Scores support decisions; they do not guarantee yield or profit.",
+   791→      "يُحسب لكل عامل درجة من 0 إلى 100 بمقارنة المناخ الشهري من NASA POWER ومدخلات مزرعتك بالاحتياجات الموثقة لكل محصول (FAO EcoCrop وورقة FAO رقم 33 وإرشادات وزارة الزراعة المصرية). الدرجة النهائية هي المتوسط المرجّح: الحرارة 30%، والماء 20%، والإشعاع الشمسي 15%، والتربة 15%، والموسم 10%، والرطوبة 5%، والرياح 5%. العوامل غير المتاحة تُستبعد ويُعاد توزيع وزنها. الدرجات لدعم القرار ولا تضمن المحصول أو الربح."
+   792→    ),
+   793→    confidence,
+   794→    confidenceNote: L(notes.map((n) => n.en).join(" "), notes.map((n) => n.ar).join(" ")),
+   795→  };
+   796→
+   797→  return { crops: results, engine };
+   798→}
+   799→

@@ -1,0 +1,849 @@
+     1→/**
+     2→ * AgriWise Climate Risk Alert System (Feature 3).
+     3→ *
+     4→ * Assesses agricultural climate risks for a selected location and crop from:
+     5→ *  - the real NASA POWER monthly climatology (365-day observations), and
+     6→ *  - the documented crop requirement ranges in the crop database (crops.ts).
+     7→ *
+     8→ * Honesty rules (mirroring the recommendation engine):
+     9→ *  - every "measured value" comes from the actual NASA data, never fabricated;
+    10→ *  - every threshold is a DOCUMENTED range from the crop database;
+    11→ *  - when a variable is missing the risk is listed as unavailable — never guessed;
+    12→ *  - forecast-based early warnings are marked as forecasts, not observations.
+    13→ *
+    14→ * Risk types evaluated:
+    15→ *  heat · cold · drought · rainfall-pattern · crop-range · radiation · wind
+    16→ * Each finding carries: type, level (low/moderate/high), measured value,
+    17→ * suitable reference range, agricultural impact and practical recommendations.
+    18→ */
+    19→
+    20→import type { CropRecord } from "./crops";
+    21→import {
+    22→  L,
+    23→  monthName,
+    24→  type Bilingual,
+    25→  type ClimateSummary,
+    26→  type FarmInput,
+    27→  type MonthlyValue,
+    28→} from "./types";
+    29→
+    30→/* ---------------- types ---------------- */
+    31→
+    32→export type RiskLevel = "low" | "moderate" | "high";
+    33→
+    34→export type RiskType =
+    35→  | "heat"
+    36→  | "cold"
+    37→  | "drought"
+    38→  | "rainfall-pattern"
+    39→  | "crop-range"
+    40→  | "radiation"
+    41→  | "wind";
+    42→
+    43→export interface RiskFinding {
+    44→  type: RiskType;
+    45→  level: RiskLevel;
+    46→  /** language-neutral measured value, e.g. "41.2 °C" */
+    47→  value: string;
+    48→  /** what the value describes, e.g. "hottest-month mean daily maximum" */
+    49→  valueLabel: Bilingual;
+    50→  /** documented suitable range / threshold for this crop */
+    51→  threshold: Bilingual;
+    52→  /** potential agricultural impact of this risk */
+    53→  impact: Bilingual;
+    54→  /** practical recommendations for the farmer */
+    55→  recommendations: Bilingual[];
+    56→  /** where the measured value comes from */
+    57→  provenance: "nasa" | "user-input" | "documented";
+    58→}
+    59→
+    60→export interface CropRiskReport {
+    61→  cropId: string;
+    62→  overall: RiskLevel;
+    63→  counts: { low: number; moderate: number; high: number };
+    64→  findings: RiskFinding[];
+    65→  /** risks that could not be evaluated because NASA data is missing */
+    66→  unavailable: RiskType[];
+    67→}
+    68→
+    69→export const RISK_TYPE_LABELS: Record<RiskType, Bilingual> = {
+    70→  heat: L("Extreme heat", "الحرارة المفرطة"),
+    71→  cold: L("Cold stress", "إجهاد البرودة"),
+    72→  drought: L("Drought & water deficit", "الجفاف ونقص المياه"),
+    73→  "rainfall-pattern": L("Unusual rainfall patterns", "أنماط هطول غير معتادة"),
+    74→  "crop-range": L("Conditions outside the crop's range", "ظروف خارج نطاق المحصول"),
+    75→  radiation: L("Solar radiation balance", "توازن الإشعاع الشمسي"),
+    76→  wind: L("Wind exposure", "التعرض للرياح"),
+    77→};
+    78→
+    79→/* ---------------- helpers ---------------- */
+    80→
+    81→const round1 = (v: number) => Math.round(v * 10) / 10;
+    82→const lvlIdx = (l: RiskLevel) => (l === "high" ? 2 : l === "moderate" ? 1 : 0);
+    83→const idxLvl = (i: number): RiskLevel => (i >= 2 ? "high" : i === 1 ? "moderate" : "low");
+    84→
+    85→const monthsLabel = (months: number[], lang: "en" | "ar") => {
+    86→  const uniq = [...new Set(months)].sort((a, b) => a - b);
+    87→  return uniq.map((m) => monthName(m, lang)).join("، ");
+    88→};
+    89→
+    90→function windowMean(
+    91→  monthly: MonthlyValue[],
+    92→  months: number[],
+    93→  key: "t2m" | "t2mMax" | "t2mMin" | "solar" | "ws10m"
+    94→): number | null {
+    95→  const vals = months
+    96→    .map((m) => monthly[m - 1]?.[key])
+    97→    .filter((v): v is number => v !== null && v !== undefined);
+    98→  if (!vals.length) return null;
+    99→  return vals.reduce((a, b) => a + b, 0) / vals.length;
+   100→}
+   101→
+   102→function windowRain(monthly: MonthlyValue[], months: number[]): number | null {
+   103→  const vals = months
+   104→    .map((m) => monthly[m - 1]?.precip)
+   105→    .filter((v): v is number => v !== null && v !== undefined);
+   106→  if (!vals.length) return null;
+   107→  return vals.reduce((a, b) => a + b, 0);
+   108→}
+   109→
+   110→/* ---------------- individual risk checks ---------------- */
+   111→
+   112→function checkHeat(
+   113→  monthly: MonthlyValue[],
+   114→  summary: ClimateSummary,
+   115→  crop: CropRecord
+   116→): RiskFinding | "unavailable" {
+   117→  const withMax = monthly.filter((m) => m.t2mMax !== null);
+   118→  if (!withMax.length || summary.extremeMaxC === null) return "unavailable";
+   119→  const hottest = withMax.reduce((a, b) =>
+   120→    (b.t2mMax as number) > (a.t2mMax as number) ? b : a
+   121→  );
+   122→  const hottestMax = hottest.t2mMax as number;
+   123→  const extreme = summary.extremeMaxC as number;
+   124→  const { optMax, absMax } = crop.temp;
+   125→
+   126→  const idx =
+   127→    hottestMax >= absMax || extreme >= absMax + 2
+   128→      ? 2
+   129→      : hottestMax >= optMax || extreme >= absMax
+   130→        ? 1
+   131→        : 0;
+   132→
+   133→  const impact =
+   134→    idx === 2
+   135→      ? L(
+   136→          `Mean daily maxima of ${round1(hottestMax)}°C in ${monthName(hottest.month, "en")} reach the absolute tolerance of this crop (${absMax}°C). Photosynthesis declines sharply, pollen viability and flower set fail, and yield potential is lost even if the plant survives.`,
+   137→          `متوسط الحرارة القصوى ${round1(hottestMax)}°م في ${monthName(hottest.month, "ar")} يبلغ حد التحمل المطلق لهذا المحصول (${absMax}°م). يتراجع البناء الضوئي بشدة، وتفشل حيوية حبوب اللقاح وعقد الأزهار، ويُفقد إنتاج المحصول حتى لو بقيت النبتة حية.`
+   138→        )
+   139→      : idx === 1
+   140→        ? L(
+   141→            `Daily maxima above the documented optimum (${optMax}°C) accelerate development, raise transpiration and water demand, and can cause flower drop or poor fruit set when they coincide with sensitive stages.`,
+   142→            `الحرارة القصوى فوق المدى الأمثل الموثق (${optMax}°م) تُسرّع النمو، وترفع النتح واحتياج الماء، وقد تسبب تساقط الأزهار أو ضعف عقد الثمار إذا تزامنت مع المراحل الحساسة.`
+   143→          )
+   144→        : L(
+   145→            `Hottest-month maxima stay within the documented tolerance — extreme heat is not the limiting factor for this crop at your location.`,
+   146→            `تبقى الحرارة القصوى في أشد الشهور ضمن حد التحمل الموثق — الحرارة المفرطة ليست العامل المحدد لهذا المحصول في موقعك.`
+   147→          );
+   148→
+   149→  const recommendations = [
+   150→    L(
+   151→      "Time planting so the most sensitive stages (flowering, fruit set, grain filling) miss the hottest weeks — see the Smart Crop Calendar below.",
+   152→      "اضبط موعد الزراعة بحيث تمر المراحل الأشد حساسية (التزهير وعقد الثمار وامتلاء الحبوب) بعيدًا عن أسابيع الذروة الحرارية — انظر تقويم المحصول الذكي أدناه."
+   153→    ),
+   154→    L(
+   155→      "Irrigate early morning or late evening and keep the soil moist ahead of heat peaks — moist soil buffers canopy temperature.",
+   156→      "اسقِ في الصباح الباكر أو المساء وحافظ على رطوبة التربة قبل الذروات الحرارية — فالتربة الرطبة تخفف حرارة النبات."
+   157→    ),
+   158→  ];
+   159→  if (idx >= 1) {
+   160→    recommendations.push(
+   161→      L(
+   162→        "For vegetables, ask your extension office about 30–50% shading nets during heat waves; for field crops ask about heat-tolerant varieties.",
+   163→        "بالنسبة للخضر اسأل مكتب الإرشاد عن شبكات التظليل بنسبة 30–50% أثناء موجات الحر؛ وللمحاصيل الحقلية اسأل عن الأصناف المتحملة للحرارة."
+   164→      )
+   165→    );
+   166→  }
+   167→  if (idx === 2) {
+   168→    recommendations.push(
+   169→      L(
+   170→        "When maxima persistently exceed the absolute tolerance, consider one of the alternative crops ranked on this page.",
+   171→        "عندما تتجاوز الحرارة القصوى حد التحمل باستمرار، فكّر في أحد المحاصيل البديلة المرتبة في هذه الصفحة."
+   172→      )
+   173→    );
+   174→  }
+   175→
+   176→  return {
+   177→    type: "heat",
+   178→    level: idxLvl(idx),
+   179→    value: `${round1(hottestMax)} °C · ${round1(extreme)} °C`,
+   180→    valueLabel: L(
+   181→      `Hottest-month mean daily max (${monthName(hottest.month, "en")}) · extreme recorded in 365 days`,
+   182→      `متوسط اليومي القصوى في أشد الشهور (${monthName(hottest.month, "ar")}) · القيمة القصوى المسجلة خلال 365 يومًا`
+   183→    ),
+   184→    threshold: L(
+   185→      `Optimum maximum ${optMax}°C · absolute tolerance ${absMax}°C`,
+   186→      `الحد الأقصى الأمثل ${optMax}°م · حد التحمل المطلق ${absMax}°م`
+   187→    ),
+   188→    impact,
+   189→    recommendations,
+   190→    provenance: "nasa",
+   191→  };
+   192→}
+   193→
+   194→function checkCold(
+   195→  monthly: MonthlyValue[],
+   196→  summary: ClimateSummary,
+   197→  crop: CropRecord
+   198→): RiskFinding | "unavailable" {
+   199→  const withMin = monthly.filter((m) => m.t2mMin !== null);
+   200→  if (!withMin.length || summary.extremeMinC === null) return "unavailable";
+   201→  const coldest = withMin.reduce((a, b) =>
+   202→    (b.t2mMin as number) < (a.t2mMin as number) ? b : a
+   203→  );
+   204→  const coldestMin = coldest.t2mMin as number;
+   205→  const extreme = summary.extremeMinC as number;
+   206→  const { optMin, absMin } = crop.temp;
+   207→
+   208→  const idx =
+   209→    coldestMin <= absMin - 2 || extreme <= absMin - 3
+   210→      ? 2
+   211→      : coldestMin <= absMin || extreme <= absMin
+   212→        ? 1
+   213→        : 0;
+   214→
+   215→  const impact =
+   216→    idx === 2
+   217→      ? L(
+   218→          `Winter minima of ${round1(coldestMin)}°C (extreme ${round1(extreme)}°C) fall well below the survival limit (${absMin}°C) — risk of chilling injury, failed germination and establishment loss in young plants.`,
+   219→          `الحرارة الدنيا الشتوية ${round1(coldestMin)}°م (والقصوى المنخفضة ${round1(extreme)}°م) تهبط كثيرًا دون حد البقاء (${absMin}°م) — خطر إصابة بالبرودة وفشل الإنبات وفقد الشتلات في النباتات الفتية.`
+   220→        )
+   221→      : idx === 1
+   222→        ? L(
+   223→            `Nights at or below the survival minimum (${absMin}°C) stall growth and development during establishment — the crop survives but loses early vigour.`,
+   224→            `الليالي عند حد البقاء أو دونه (${absMin}°م) توقف النمو والتطور أثناء الإنشاء — يبقى المحصول حيًا لكنه يفقد قوته المبكرة.`
+   225→          )
+   226→        : L(
+   227→            `Coldest-month minima remain within the documented tolerance — cold stress is unlikely to limit this crop at your location.`,
+   228→            `تبقى الحرارة الدنيا في أبرد الشهور ضمن حد التحمل الموثق — إجهاد البرودة غير مرجّح أن يحدّ هذا المحصول في موقعك.`
+   229→          );
+   230→
+   231→  return {
+   232→    type: "cold",
+   233→    level: idxLvl(idx),
+   234→    value: `${round1(coldestMin)} °C · ${round1(extreme)} °C`,
+   235→    valueLabel: L(
+   236→      `Coldest-month mean daily min (${monthName(coldest.month, "en")}) · extreme recorded in 365 days`,
+   237→      `متوسط اليومي الدنيا في أبرد الشهور (${monthName(coldest.month, "ar")}) · القيمة الدنيا القصوى المسجلة خلال 365 يومًا`
+   238→    ),
+   239→    threshold: L(
+   240→      `Optimum minimum ${optMin}°C · survival limit ${absMin}°C`,
+   241→      `الحد الأدنى الأمثل ${optMin}°م · حد البقاء ${absMin}°م`
+   242→    ),
+   243→    impact,
+   244→    recommendations: [
+   245→      L(
+   246→        "Follow the planting window in the Smart Crop Calendar so establishment misses the coldest weeks.",
+   247→        "اتبع نافذة الزراعة في تقويم المحصول الذكي بحيث يمر الإنشاء بعيدًا عن أبرد الأسابيع."
+   248→      ),
+   249→      L(
+   250→        "Avoid establishing cold-sensitive crops in December–January in Upper Egypt.",
+   251→        "تجنّب إنشاء المحاصيل الحساسة للبرودة في ديسمبر–يناير في الصعيد."
+   252→      ),
+   253→      ...(idx >= 1
+   254→        ? [
+   255→            L(
+   256→              "For high-value crops use low tunnels or row covers on cold nights; they lift night temperature around the plants.",
+   257→              "للمحاصيل عالية القيمة استخدم الأنفاق المنخفضة أو أغطية الصفوف في الليالي الباردة؛ فهي ترفع حرارة الليل حول النباتات."
+   258→            ),
+   259→          ]
+   260→        : []),
+   261→    ],
+   262→    provenance: "nasa",
+   263→  };
+   264→}
+   265→
+   266→function checkDrought(
+   267→  monthly: MonthlyValue[],
+   268→  summary: ClimateSummary,
+   269→  farm: FarmInput,
+   270→  crop: CropRecord,
+   271→  windowMonths: number[]
+   272→): RiskFinding | "unavailable" {
+   273→  const annual = summary.annualRainfallMm;
+   274→  const winRain = windowRain(monthly, windowMonths);
+   275→  if (winRain === null) return "unavailable";
+   276→  const [needMin, needMax] = crop.water.seasonNeedMm;
+   277→
+   278→  // rainfall deficit relative to the documented seasonal requirement
+   279→  const f = winRain / needMin;
+   280→  const deficitIdx = f < 0.05 ? 2 : f < 0.25 ? 1 : 0;
+   281→
+   282→  // mismatch between the farmer's reported water availability and the crop need level
+   283→  const mismatch =
+   284→    crop.water.category === "very-high"
+   285→      ? { limited: 2, moderate: 1, abundant: 0 }
+   286→      : crop.water.category === "high"
+   287→        ? { limited: 2, moderate: 1, abundant: 0 }
+   288→        : crop.water.category === "medium"
+   289→          ? { limited: 1, moderate: 0, abundant: 0 }
+   290→          : { limited: 0, moderate: 0, abundant: 0 };
+   291→  const supplyIdx = mismatch[farm.waterAvailability];
+   292→
+   293→  // abundant irrigation relieves one notch of the rainfall deficit
+   294→  const relief = farm.waterAvailability === "abundant" ? 1 : 0;
+   295→  const idx = Math.max(lvlIdx(idxLvl(deficitIdx)) - relief, supplyIdx);
+   296→  const pct = Math.round((winRain / needMin) * 100);
+   297→
+   298→  const impact =
+   299→    idx === 2
+   300→      ? L(
+   301→          `Rainfall inside the growing window (${round1(winRain)} mm) supplies only ${pct}% of the documented seasonal requirement (${needMin}–${needMax} mm), and your reported water supply is below what this crop needs. Water stress here means direct yield loss and, for perennial crops, stand failure.`,
+   302→          `الهطول داخل نافذة النمو (${round1(winRain)} مم) يوفر ${pct}% فقط من الاحتياج الموسمي الموثق (${needMin}–${needMax} مم)، ومياهك المعلنة أقل من احتياج هذا المحصول. الإجهاد المائي هنا يعني نقصًا مباشرًا في المحصول، ولمحاصيل الأعوام المتعددة فقدان المزرعة نفسها.`
+   303→        )
+   304→      : idx === 1
+   305→        ? L(
+   306→            `Rainfall covers only ${pct}% of the documented seasonal requirement (${needMin}–${needMax} mm) — irrigation must reliably close the gap, and any interruption during heat peaks turns into visible water stress.`,
+   307→            `يغطي الهطول ${pct}% فقط من الاحتياج الموسمي الموثق (${needMin}–${needMax} مم) — يجب أن يغطي الري هذه الفجوة باطمئنان، وأي انقطاع أثناء الذروات الحرارية يتحول إلى إجهاد مائي ظاهر.`
+   308→          )
+   309→        : L(
+   310→            `Rainfall is negligible (${round1(winRain)} mm in the window) as expected in an arid climate — the documented requirement (${needMin}–${needMax} mm) must come from irrigation, and your reported supply matches this crop's need level.`,
+   311→            `الهطول منعدم تقريبًا (${round1(winRain)} مم في النافذة) كما هو متوقع في مناخ جاف — يجب أن يأتي الاحتياج الموثق (${needMin}–${needMax} مم) من الري، ومياهك المعلنة تناسب مستوى احتياج هذا المحصول.`
+   312→          );
+   313→
+   314→  return {
+   315→    type: "drought",
+   316→    level: idxLvl(idx),
+   317→    value: `${round1(winRain)} mm / ${needMin}–${needMax} mm`,
+   318→    valueLabel: L(
+   319→      `Rainfall in the growing window vs documented seasonal need (annual rainfall ${round1(annual)} mm)`,
+   320→      `الهطول داخل نافذة النمو مقابل الاحتياج الموسمي الموثق (الهطول السنوي ${round1(annual)} مم)`
+   321→    ),
+   322→    threshold: L(
+   323→      `Documented seasonal requirement ${needMin}–${needMax} mm · your reported availability: see Farm Analysis`,
+   324→      `الاحتياج الموسمي الموثق ${needMin}–${needMax} مم · توفرك المعلن للمياه: انظر تحليل المزرعة`
+   325→    ),
+   326→    impact,
+   327→    recommendations: [
+   328→      L(
+   329→        "Match the crop to your reliable water supply — compare the irrigation gap shown for every alternative on this page.",
+   330→        "طابق المحصول مع مياهك الموثوقة — قارن فجوة الري المعروضة لكل بديل في هذه الصفحة."
+   331→      ),
+   332→      L(
+   333→        "Follow the stage water shares in the Smart Crop Calendar: give priority to the critical stages marked there.",
+   334→        "اتبع حصص الماء لكل مرحلة في تقويم المحصول الذكي: أعطِ الأولية للمراحل الحرجة المعلّمة هناك."
+   335→      ),
+   336→      L(
+   337→        "Mulch the surface and keep weeds out — both cut evaporation losses from the topsoil.",
+   338→        "غطِّ سطح التربة وأزل الأعشاب — كلاهما يقلل فواقد التبخر من سطح التربة."
+   339→      ),
+   340→    ],
+   341→    provenance: "user-input",
+   342→  };
+   343→}
+   344→
+   345→function checkRainfallPattern(
+   346→  monthly: MonthlyValue[]
+   347→): RiskFinding | "unavailable" {
+   348→  const withRain = monthly.filter((m) => m.precip !== null);
+   349→  if (!withRain.length) return "unavailable";
+   350→  const annual = withRain.reduce((a, m) => a + (m.precip as number), 0);
+   351→  const peak = withRain.reduce((a, b) =>
+   352→    (b.precip as number) > (a.precip as number) ? b : a
+   353→  );
+   354→  const share = annual > 0 ? (peak.precip as number) / annual : 0;
+   355→  const dryMonths = withRain.filter((m) => (m.precip as number) < 5).length;
+   356→
+   357→  let idx = 0;
+   358→  if (annual >= 60) {
+   359→    if ((peak.precip as number) >= 50 || share > 0.8) idx = 2;
+   360→    else if (share > 0.6) idx = 1;
+   361→  }
+   362→
+   363→  const impact =
+   364→    annual < 60
+   365→      ? L(
+   366→          `Annual rainfall is only ${round1(annual)} mm — effectively a fully irrigated climate. Unusual rainfall events are not a significant constraint at this location; water risk is covered by the drought indicator.`,
+   367→          `الهطول السنوي ${round1(annual)} مم فقط — مناخ يعتمد على الري كليًا. أنماط الهطول غير المعتادة ليست قيدًا مهمًا في هذا الموقع؛ خطر الماء مغطى بمؤشر الجفاف.`
+   368→        )
+   369→      : idx === 2
+   370→        ? L(
+   371→            `${Math.round(share * 100)}% of the annual rain falls in ${monthName(peak.month, "en")} (${round1(peak.precip as number)} mm). Concentrated bursts damage seedlings, leach fertilizer, and can flood low-lying fields; the rest of the year stays dry.`,
+   372→            `${Math.round(share * 100)}% من مطر السنة ينزل في ${monthName(peak.month, "ar")} (${round1(peak.precip as number)} مم). الدفعات المركزة تضر الشتلات وتغسل السماد وقد تغمر الأراضي المنخفضة؛ ويبقى بقية العام جافًا.`
+   373→          )
+   374→        : L(
+   375→            `Rainfall is reasonably distributed across ${12 - dryMonths} rain-bearing months — no dominant flood month detected in the NASA record.`,
+   376→            `الهطول موزّع بشكل معقول على ${12 - dryMonths} أشهر ممطرة — لا شهر غمر مسيطر في سجل ناسا.`
+   377→          );
+   378→
+   379→  return {
+   380→    type: "rainfall-pattern",
+   381→    level: idxLvl(idx),
+   382→    value:
+   383→      annual < 60
+   384→        ? `${round1(annual)} mm`
+   385→        : `${round1(peak.precip as number)} mm (${Math.round(share * 100)}%)`,
+   386→    valueLabel: L(
+   387→      `Peak monthly rainfall (${monthName(peak.month, "en")}) and its share of the annual total`,
+   388→      `ذروة الهطول الشهري (${monthName(peak.month, "ar")}) ونسبتها من المجموع السنوي`
+   389→    ),
+   390→    threshold: L(
+   391→      "Reference: a balanced pattern spreads rainfall across months; one month above ~70% of the annual total signals concentration and flash-flood risk",
+   392→      "مرجع: النمط المتوازن يوزع الهطول على الشهور؛ وسيطرة شهر واحد على ~70% من المجموع السنوي تشير إلى تركز وخطر سيول"
+   393→    ),
+   394→    impact,
+   395→    recommendations:
+   396→      idx >= 1
+   397→        ? [
+   398→            L(
+   399→              `Check field drainage and bunds before ${monthName(peak.month, "en")}; avoid low spots where water ponds.`,
+   400→              `افحص صرف الحقل والجسوز قبل ${monthName(peak.month, "ar")}؛ وتجنب البقع المنخفضة حيث يتجمع الماء.`
+   401→            ),
+   402→            L(
+   403→              "After a heavy rainfall event: re-aerate the soil, top up the leached fertilizer and inspect for fungal outbreaks.",
+   404→              "بعد حدث مطري غزير: أعد تهوية التربة، وعوّض السماد المغسول، وافحص ظهور الفطريات."
+   405→            ),
+   406→          ]
+   407→        : [
+   408→            L(
+   409→              "No rainfall-pattern action needed — plan your irrigation calendar instead (see the Smart Crop Calendar).",
+   410→              "لا إجراء مطلوبًا بشأن نمط الهطول — خطط لجدول الري بدلًا من ذلك (انظر تقويم المحصول الذكي)."
+   411→            ),
+   412→          ],
+   413→    provenance: "nasa",
+   414→  };
+   415→}
+   416→
+   417→function checkCropRange(
+   418→  monthly: MonthlyValue[],
+   419→  crop: CropRecord,
+   420→  windowMonths: number[],
+   421→  lang: "en" | "ar"
+   422→): RiskFinding | "unavailable" {
+   423→  const meanT = windowMean(monthly, windowMonths, "t2m");
+   424→  if (meanT === null) return "unavailable";
+   425→  const { absMin, optMin, optMax, absMax } = crop.temp;
+   426→  const outsideOpt = windowMonths.filter((m) => {
+   427→    const t = monthly[m - 1]?.t2m;
+   428→    return t !== null && t !== undefined && (t < optMin || t > optMax);
+   429→  });
+   430→
+   431→  const idx =
+   432→    meanT <= absMin || meanT >= absMax
+   433→      ? 2
+   434→      : meanT < optMin || meanT > optMax || outsideOpt.length >= 2
+   435→        ? 1
+   436→        : 0;
+   437→
+   438→  const impact =
+   439→    idx === 2
+   440→      ? L(
+   441→          `The mean temperature over the growing window (${round1(meanT)}°C) falls outside the crop's absolute tolerance (${absMin}–${absMax}°C) — the crop cannot complete its cycle reliably under these conditions.`,
+   442→          `متوسط الحرارة داخل نافذة النمو (${round1(meanT)}°م) يقع خارج حد التحمل المطلق للمحصول (${absMin}–${absMax}°م) — لا يستطيع المحصول إكمال دورته باطمئنان في هذه الظروف.`
+   443→        )
+   444→      : idx === 1
+   445→        ? L(
+   446→            `The window mean of ${round1(meanT)}°C and ${outsideOpt.length} month(s) sit outside the documented optimum (${optMin}–${optMax}°C) — the crop completes its cycle but with reduced vigour and yield potential in those months (${monthsLabel(outsideOpt, lang)}).`,
+   447→            `متوسط النافذة ${round1(meanT)}°م و${outsideOpt.length} شهرًا خارج المدى الأمثل الموثق (${optMin}–${optMax}°م) — يكمل المحصول دورته لكن بقوة وإنتاجية أقل في تلك الشهور (${monthsLabel(outsideOpt, lang)}).`
+   448→        )
+   449→        : L(
+   450→            `Window mean of ${round1(meanT)}°C stays inside the documented optimum (${optMin}–${optMax}°C) — thermal conditions suit this crop's cycle.`,
+   451→            `متوسط النافذة ${round1(meanT)}°م يبقى داخل المدى الأمثل الموثق (${optMin}–${optMax}°م) — الظروف الحرارية تناسب دورة هذا المحصول.`
+   452→        );
+   453→
+   454→  return {
+   455→    type: "crop-range",
+   456→    level: idxLvl(idx),
+   457→    value: `${round1(meanT)} °C`,
+   458→    valueLabel: L(
+   459→      "Mean air temperature over the evaluated growing window",
+   460→      "متوسط درجة حرارة الهواء خلال نافذة النمو المقيَّمة"
+   461→    ),
+   462→    threshold: L(
+   463→      `Documented optimum ${optMin}–${optMax}°C · tolerance ${absMin}–${absMax}°C`,
+   464→      `المدى الأمثل الموثق ${optMin}–${optMax}°م · حد التحمل ${absMin}–${absMax}°م`
+   465→    ),
+   466→    impact,
+   467→    recommendations:
+   468→      idx >= 1
+   469→        ? [
+   470→            L(
+   471→              "Shift planting by a few weeks so the sensitive stages move inside the optimum band — compare with the calendar below.",
+   472→              "زحزح موعد الزراعة بضعة أسابيع بحيث تنتقل المراحل الحساسة داخل المدى الأمثل — قارن مع التقويم أدناه."
+   473→            ),
+   474→            L(
+   475→              "If the whole window is off-range, weigh the alternative crops for this season on this page.",
+   476→              "إن كانت النافذة كلها خارج المدى، فوازن بدائل المحاصيل لهذا الموسم في هذه الصفحة."
+   477→            ),
+   478→          ]
+   479→        : [
+   480→            L(
+   481→              "No adjustment needed — the selected window already sits in the crop's optimum range.",
+   482→              "لا تعديل مطلوبًا — النافذة المختارة تقع أصلًا داخل المدى الأمثل للمحصول."
+   483→            ),
+   484→          ],
+   485→    provenance: "nasa",
+   486→  };
+   487→}
+   488→
+   489→function checkRadiation(
+   490→  monthly: MonthlyValue[],
+   491→  crop: CropRecord,
+   492→  windowMonths: number[]
+   493→): RiskFinding | "unavailable" {
+   494→  const meanSolar = windowMean(monthly, windowMonths, "solar");
+   495→  if (meanSolar === null) return "unavailable";
+   496→  const { optMin, optMax } = crop.solar;
+   497→
+   498→  const idx =
+   499→    meanSolar < optMin - 1.5 || meanSolar > optMax + 1.5
+   500→      ? 1
+   501→      : meanSolar < optMin || meanSolar > optMax
+   502→        ? 1
+   503→        : 0;
+   504→
+   505→  const impact =
+   506→    meanSolar < optMin
+   507→      ? L(
+   508→          `Mean solar radiation in the window (${round1(meanSolar)} kWh/m²/day) is below the documented optimum (${optMin}–${optMax}) — photosynthesis-driven growth slows and yields decline.`,
+   509→          `متوسط الإشعاع الشمسي في النافذة (${round1(meanSolar)} كيلوواط·س/م²/يوم) دون الأمثل الموثق (${optMin}–${optMax}) — يتباطأ النمو المدفوع بالبناء الضوئي وتتراجع الإنتاجية.`
+   510→        )
+   511→      : meanSolar > optMax
+   512→        ? L(
+   513→            `Mean solar radiation (${round1(meanSolar)} kWh/m²/day) exceeds the documented optimum (${optMin}–${optMax}) — radiation itself is rarely harmful, but it amplifies heat and evaporation stress.`,
+   514→            `متوسط الإشعاع الشمسي (${round1(meanSolar)} كيلوواط·س/م²/يوم) يتجاوز الأمثل الموثق (${optMin}–${optMax}) — الإشعاع ذاته نادرًا ما يكون ضارًا، لكنه يضاعف إجهاد الحرارة والتبخر.`
+   515→          )
+   516→        : L(
+   517→            `Radiation of ${round1(meanSolar)} kWh/m²/day sits inside the documented optimum (${optMin}–${optMax}) — a genuine asset for this crop's yield.`,
+   518→            `الإشعاع ${round1(meanSolar)} كيلوواط·س/م²/يوم يقع داخل المدى الأمثل الموثق (${optMin}–${optMax}) — ميزة حقيقية لإنتاجية هذا المحصول.`
+   519→          );
+   520→
+   521→  return {
+   522→    type: "radiation",
+   523→    level: idxLvl(idx),
+   524→    value: `${round1(meanSolar)} kWh/m²/day`,
+   525→    valueLabel: L(
+   526→      "Mean solar radiation over the growing window",
+   527→      "متوسط الإشعاع الشمسي خلال نافذة النمو"
+   528→    ),
+   529→    threshold: L(
+   530→      `Documented optimum ${optMin}–${optMax} kWh/m²/day`,
+   531→      `المدى الأمثل الموثق ${optMin}–${optMax} كيلوواط·س/م²/يوم`
+   532→    ),
+   533→    impact,
+   534→    recommendations: [
+   535→      L(
+   536→        "High radiation goes with high evaporation — keep the irrigation schedule from the crop calendar.",
+   537→        "الإشعاع العالي يعني تبخرًا عاليًا — حافظ على جدول الري من تقويم المحصول."
+   538→      ),
+   539→    ],
+   540→    provenance: "nasa",
+   541→  };
+   542→}
+   543→
+   544→function checkWind(
+   545→  monthly: MonthlyValue[],
+   546→  crop: CropRecord
+   547→): RiskFinding | "unavailable" {
+   548→  const withWind = monthly.filter((m) => m.ws10m !== null);
+   549→  if (!withWind.length) return "unavailable";
+   550→  const windiest = withWind.reduce((a, b) =>
+   551→    (b.ws10m as number) > (a.ws10m as number) ? b : a
+   552→  );
+   553→  const windiestVal = windiest.ws10m as number;
+   554→  const tol = crop.windTolerance;
+   555→
+   556→  const idx =
+   557→    windiestVal >= tol + 1.5 ? 2 : windiestVal >= tol ? 1 : 0;
+   558→
+   559→  const impact =
+   560→    idx === 2
+   561→      ? L(
+   562→          `The windiest month averages ${round1(windiestVal)} m/s — above the documented problem level (${tol} m/s) for this crop. Expect stronger lodging (stems breaking) for tall crops, leaf physical damage, and markedly higher evaporation.`,
+   563→          `أكثر الشهور رياحًا يسجل متوسطًا ${round1(windiestVal)} م/ث — فوق مستوى المشكلات الموثق (${tol} م/ث) لهذا المحصول. توقع رقودًا أشد (انكسار السيقان) للمحاصيل الطويلة، وتلفًا ميكانيكيًا للأوراق، وتبخرًا أعلى بوضوح.`
+   564→        )
+   565→      : idx === 1
+   566→        ? L(
+   567→            `Winds in the windiest month (${round1(windiestVal)} m/s) reach the documented caution level (${tol} m/s) — lodging risk rises for tall crops and evaporation increases.`,
+   568→            `الرياح في أكثر الشهور (${round1(windiestVal)} م/ث) تبلغ مستوى الحذر الموثق (${tol} م/ث) — يرتفع خطر الرقود للمحاصيل الطويلة ويزيد التبخر.`
+   569→          )
+   570→        : L(
+   571→            `Windiest-month mean of ${round1(windiestVal)} m/s stays below the crop's caution level (${tol} m/s) — wind is not a limiting factor.`,
+   572→            `متوسط أكثر الشهور رياحًا (${round1(windiestVal)} م/ث) يبقى دون مستوى الحذر للمحصول (${tol} م/ث) — الرياح ليست عاملًا محددًا.`
+   573→          );
+   574→
+   575→  return {
+   576→    type: "wind",
+   577→    level: idxLvl(idx),
+   578→    value: `${round1(windiestVal)} m/s`,
+   579→    valueLabel: L(
+   580→      `Windiest-month mean wind speed (${monthName(windiest.month, "en")})`,
+   581→      `متوسط سرعة الرياح في أكثر الشهور رياحًا (${monthName(windiest.month, "ar")})`
+   582→    ),
+   583→    threshold: L(
+   584→      `Documented caution level for this crop: sustained means above ${tol} m/s`,
+   585→      `مستوى الحذر الموثق لهذا المحصول: متوسطات مستمرة فوق ${tol} م/ث`
+   586→    ),
+   587→    impact,
+   588→    recommendations:
+   589→      idx >= 1
+   590→        ? [
+   591→            L(
+   592→              "Plant windbreak rows (Casuarina and similar trees are used in Egyptian farms) on the windward side; they protect for roughly 10–20 times their height.",
+   593→              "ازرع صفوف مصدفات الرياح (الكازورينا وأشباهها مستخدمة في المزارع المصرية) في الجهة القبلية للرياح؛ فهي تحمي مسافة تعادل نحو 10–20 ضعف ارتفاعها."
+   594→            ),
+   595→            L(
+   596→              "Avoid over-irrigating into wind-stressed days — water is lost to evaporation before the crop uses it.",
+   597→              "تجنب الإفراط في الري في أيام إجهاد الرياح — يفقد الماء بالتبخر قبل أن يستفيد منه المحصول."
+   598→            ),
+   599→          ]
+   600→        : [
+   601→            L(
+   602→              "No wind action needed for this crop at this location.",
+   603→              "لا إجراء مطلوبًا بشأن الرياح لهذا المحصول في هذا الموقع."
+   604→            ),
+   605→          ],
+   606→    provenance: "nasa",
+   607→  };
+   608→}
+   609→
+   610→/* ---------------- main assessment ---------------- */
+   611→
+   612→export function assessCropRisk(
+   613→  monthly: MonthlyValue[],
+   614→  summary: ClimateSummary,
+   615→  farm: FarmInput,
+   616→  crop: CropRecord,
+   617→  windowMonths: number[]
+   618→): CropRiskReport {
+   619→  const findings: RiskFinding[] = [];
+   620→  const unavailable: RiskType[] = [];
+   621→
+   622→  const push = (type: RiskType, r: RiskFinding | "unavailable") => {
+   623→    if (r === "unavailable") unavailable.push(type);
+   624→    else findings.push(r);
+   625→  };
+   626→
+   627→  push("heat", checkHeat(monthly, summary, crop));
+   628→  push("cold", checkCold(monthly, summary, crop));
+   629→  push("drought", checkDrought(monthly, summary, farm, crop, windowMonths));
+   630→  push("rainfall-pattern", checkRainfallPattern(monthly));
+   631→  push("crop-range", checkCropRange(monthly, crop, windowMonths, "en"));
+   632→  push("radiation", checkRadiation(monthly, crop, windowMonths));
+   633→  push("wind", checkWind(monthly, crop));
+   634→
+   635→  const order: RiskType[] = [
+   636→    "heat",
+   637→    "cold",
+   638→    "drought",
+   639→    "rainfall-pattern",
+   640→    "crop-range",
+   641→    "radiation",
+   642→    "wind",
+   643→  ];
+   644→  findings.sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
+   645→
+   646→  const counts = { low: 0, moderate: 0, high: 0 };
+   647→  for (const f of findings) counts[f.level] += 1;
+   648→  const overall: RiskLevel = counts.high
+   649→    ? "high"
+   650→    : counts.moderate
+   651→      ? "moderate"
+   652→      : "low";
+   653→
+   654→  return { cropId: crop.id, overall, counts, findings, unavailable };
+   655→}
+   656→
+   657→/* ---------------- forecast early warnings ---------------- */
+   658→
+   659→export interface ForecastDay {
+   660→  date: string; // YYYY-MM-DD
+   661→  tmax: number | null;
+   662→  tmin: number | null;
+   663→  precip: number | null;
+   664→  windMax: number | null; // m/s
+   665→}
+   666→
+   667→export type WarningType = "heat" | "cold" | "rain" | "wind";
+   668→
+   669→export interface EarlyWarning {
+   670→  type: WarningType;
+   671→  level: RiskLevel;
+   672→  dates: string[];
+   673→  value: string;
+   674→  valueLabel: Bilingual;
+   675→  threshold: Bilingual;
+   676→  impact: Bilingual;
+   677→  recommendations: Bilingual[];
+   678→}
+   679→
+   680→const fmtDateShort = (iso: string) => iso; // UI localizes with toLocaleDateString
+   681→
+   682→export function assessForecastWarnings(
+   683→  days: ForecastDay[],
+   684→  crop: CropRecord
+   685→): EarlyWarning[] {
+   686→  const warnings: EarlyWarning[] = [];
+   687→  if (!days.length) return warnings;
+   688→  const { absMax, optMax, absMin, optMin } = crop.temp;
+   689→  const tol = crop.windTolerance;
+   690→
+   691→  // heat
+   692→  const heatDates = days.filter(
+   693→    (d) => d.tmax !== null && (d.tmax >= absMax || d.tmax >= optMax)
+   694→  );
+   695→  if (heatDates.length) {
+   696→    const high = heatDates.some((d) => (d.tmax as number) >= absMax);
+   697→    const maxT = Math.max(...heatDates.map((d) => d.tmax as number));
+   698→    warnings.push({
+   699→      type: "heat",
+   700→      level: high ? "high" : "moderate",
+   701→      dates: heatDates.map((d) => fmtDateShort(d.date)),
+   702→      value: `${round1(maxT)} °C`,
+   703→      valueLabel: L(
+   704→        `Highest forecast daily maximum in the next ${days.length} days`,
+   705→        `أعلى حرارة قصوى متوقعة خلال ${days.length} أيام قادمة`
+   706→      ),
+   707→      threshold: L(
+   708→        `Optimum max ${optMax}°C · absolute tolerance ${absMax}°C`,
+   709→        `الحد الأقصى الأمثل ${optMax}°م · حد التحمل المطلق ${absMax}°م`
+   710→      ),
+   711→      impact: L(
+   712→        high
+   713→          ? "Forecast maxima reach the crop's absolute heat tolerance — vulnerable stages can suffer flower drop, failed fruit set or pollen death within days."
+   714→          : "Forecast maxima exceed the crop's optimum — expect faster development, higher water demand and possible flower drop in sensitive stages.",
+   715→        high
+   716→          ? "الحرارة القصوى المتوقعة تبلغ حد التحمل المطلق — قد تتضرر المراحل الحساسة بتساقط الأزهار وضعف العقد أو موت حبوب اللقاح خلال أيام."
+   717→          : "الحرارة القصوى المتوقعة تتجاوز المدى الأمثل — توقع نموًا أسرع واحتياجًا مائيًا أعلى واحتمال تساقط الأزهار في المراحل الحساسة."
+   718→      ),
+   719→      recommendations: [
+   720→        L(
+   721→          "Pre-irrigate before the flagged days so the soil is moist — moist soil buffers canopy temperature.",
+   722→          "اسقِ مسبقًا قبل الأيام المعلّمة بحيث تكون التربة رطبة — التربة الرطبة تخفف حرارة النبات."
+   723→        ),
+   724→        L(
+   725→          "Avoid spraying or fertilizing on the peak-heat days; do field work in the early morning.",
+   726→          "تجنب الرش أو التسميد في أيام ذروة الحرارة؛ ونفذ الأعمال الحقلية في الصباح الباكر."
+   727→        ),
+   728→      ],
+   729→    });
+   730→  }
+   731→
+   732→  // cold
+   733→  const coldDates = days.filter(
+   734→    (d) => d.tmin !== null && (d.tmin <= absMin || d.tmin <= optMin)
+   735→  );
+   736→  if (coldDates.length) {
+   737→    const high = coldDates.some((d) => (d.tmin as number) <= absMin);
+   738→    const minT = Math.min(...coldDates.map((d) => d.tmin as number));
+   739→    warnings.push({
+   740→      type: "cold",
+   741→      level: high ? "high" : "moderate",
+   742→      dates: coldDates.map((d) => fmtDateShort(d.date)),
+   743→      value: `${round1(minT)} °C`,
+   744→      valueLabel: L(
+   745→        `Lowest forecast daily minimum in the next ${days.length} days`,
+   746→        `أدنى حرارة دنيا متوقعة خلال ${days.length} أيام قادمة`
+   747→      ),
+   748→      threshold: L(
+   749→        `Optimum min ${optMin}°C · survival limit ${absMin}°C`,
+   750→        `الحد الأدنى الأمثل ${optMin}°م · حد البقاء ${absMin}°م`
+   751→      ),
+   752→      impact: L(
+   753→        high
+   754→          ? "Forecast minima reach the crop's survival limit — young plants and flowers can suffer chilling injury on these nights."
+   755→          : "Forecast nights fall below the crop's optimum — growth and establishment slow on the flagged days.",
+   756→        high
+   757→          ? "الحرارة الدنيا المتوقعة تبلغ حد البقاء — قد تتعرض النباتات الفتية والأزهار لإصابة البرودة في تلك الليالي."
+   758→          : "الليالي المتوقعة تهبط دون المدى الأمثل — يتباطأ النمو والإنشاء في الأيام المعلّمة."
+   759→      ),
+   760→      recommendations: [
+   761→        L(
+   762→          "Cover high-value beds with fleece or low tunnels on the flagged nights.",
+   763→          "غطِّ الأحواض عالية القيمة بالفليس أو الأنفاق المنخفضة في الليالي المعلّمة."
+   764→        ),
+   765→      ],
+   766→    });
+   767→  }
+   768→
+   769→  // rainfall event
+   770→  const totalRain = days.reduce((a, d) => a + (d.precip ?? 0), 0);
+   771→  const rainDates = days.filter((d) => (d.precip ?? 0) >= 10);
+   772→  if (totalRain >= 10 || rainDates.length) {
+   773→    const burst = Math.max(...days.map((d) => d.precip ?? 0));
+   774→    warnings.push({
+   775→      type: "rain",
+   776→      level: burst >= 25 ? "high" : "moderate",
+   777→      dates: rainDates.length
+   778→        ? rainDates.map((d) => fmtDateShort(d.date))
+   779→        : days.map((d) => fmtDateShort(d.date)),
+   780→      value: `${round1(totalRain)} mm`,
+   781→      valueLabel: L(
+   782→        `Total forecast precipitation over ${days.length} days (peak day ${round1(burst)} mm)`,
+   783→        `إجمالي الهطول المتوقع خلال ${days.length} أيام (ذروة يوم واحد ${round1(burst)} مم)`
+   784→      ),
+   785→      threshold: L(
+   786→        "Reference for arid Upper Egypt: a single day ≥ 25 mm can run off and pond; 10 mm already interrupts field operations",
+   787→        "مرجع للصعيد الجاف: يوم واحد ≥ 25 مم قد يجري على السطح ويتجمع؛ و10 مم تكفي لتعطيل الأعمال الحقلية"
+   788→      ),
+   789→      impact: L(
+   790→        "Rain events in an arid region wet leaves and topsoil — fungal spores activate, fertilizer leaches and irrigation demand pauses only briefly.",
+   791→        "الأمطار في المناطق الجافة تبتل الأوراق وسطح التربة — تنشط جراثيم الفطريات، ويُغسل السماد، ويتوقف احتياج الري توقفًا قصيرًا فقط."
+   792→      ),
+   793→      recommendations: [
+   794→        L(
+   795→          "Pause irrigation on the rainy days and resume only after the topsoil dries.",
+   796→          "أوقف الري في الأيام الممطرة واستأنف بعد جفاف سطح التربة."
+   797→        ),
+   798→        L(
+   799→          "After the event, check drainage, top-up leached fertilizer and scout for fungal spots on leaves.",
+   800→          "بعد الحدث افحص الصرف، وعوّض السماد المغسول، وافحص الأوراق بحثًا عن بقع فطرية."
+   801→        ),
+   802→      ],
+   803→    });
+   804→  }
+   805→
+   806→  // wind
+   807→  const windDates = days.filter(
+   808→    (d) => d.windMax !== null && d.windMax >= tol
+   809→  );
+   810→  if (windDates.length) {
+   811→    const high = windDates.some((d) => (d.windMax as number) >= tol + 3);
+   812→    const maxW = Math.max(...windDates.map((d) => d.windMax as number));
+   813→    warnings.push({
+   814→      type: "wind",
+   815→      level: high ? "high" : "moderate",
+   816→      dates: windDates.map((d) => fmtDateShort(d.date)),
+   817→      value: `${round1(maxW)} m/s`,
+   818→      valueLabel: L(
+   819→        `Peak forecast gusts (daily max) in the next ${days.length} days`,
+   820→        `ذروة الرياح المتوقعة (القصوى اليومية) خلال ${days.length} أيام قادمة`
+   821→      ),
+   822→      threshold: L(
+   823→        `Documented caution level for this crop: above ${tol} m/s`,
+   824→        `مستوى الحذر الموثق لهذا المحصول: فوق ${tol} م/ث`
+   825→      ),
+   826→      impact: L(
+   827→        high
+   828→          ? "Forecast wind peaks are well above the crop's caution level — lodging of tall stems, leaf tearing and heavy evaporation losses are likely."
+   829→          : "Forecast winds reach the crop's caution level — lodging risk for tall crops and higher evaporation.",
+   830→        high
+   831→          ? "ذروة الرياح المتوقعة أعلى بكثير من مستوى الحذر — يُرجّح رقود السيقان الطويلة وتمزق الأوراق وفواقد تبخر كبيرة."
+   832→          : "الرياح المتوقعة تبلغ مستوى الحذر — خطر رقود للمحاصيل الطويلة وتبخر أعلى."
+   833→      ),
+   834→      recommendations: [
+   835→        L(
+   836→          "Postpone spraying and transplanting to calmer days — drift wastes product and young plants whip.",
+   837→          "أجّل الرش والشتلات إلى أيام أهدأ — الانجراف يهدر المنتج والشتلات الفتية تتأذى."
+   838→        ),
+   839→        L(
+   840→          "Irrigate the morning before windy days rather than during them.",
+   841→          "اسقِ صباح اليوم السابق للأيام العاصفة لا أثناءها."
+   842→        ),
+   843→      ],
+   844→    });
+   845→  }
+   846→
+   847→  return warnings;
+   848→}
+   849→

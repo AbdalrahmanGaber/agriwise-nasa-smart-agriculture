@@ -1,0 +1,735 @@
+     1→     1→/**
+     2→     2→ * Smart Planting Time Advisor engine (server-side).
+     3→     3→ *
+     4→     4→ * Answers: "Plant now, or wait?" for a given crop + location.
+     5→     5→ *
+     6→     6→ * DATA BASIS (all real, all labelled):
+     7→     7→ *  - 25-year NASA POWER climatology (monthly means; monthly extremes)
+     8→     8→ *  - ~3 years of NASA POWER daily observations (mean daily max/min per month)
+     9→     9→ *  - last ~60 days of NASA POWER daily observations ("current conditions")
+    10→    10→ *  - optional 7-day Open-Meteo forecast (clearly marked as forecast)
+    11→    11→ *  - documented crop requirements from the AgriWise crop database
+    12→    12→ *    (FAO EcoCrop / FAO I&D 33 / FAO-56 / MALR references)
+    13→    13→ *
+    14→    14→ * METHOD:
+    15→    15→ *  1. Every calendar month gets a 0–100 suitability score computed from
+    16→    16→ *     the climatology against the crop's DOCUMENTED requirements
+    17→    17→ *     (temperature envelope, daytime heat, night cold, solar, humidity,
+    18→    18→ *     wind). Rainfall is reported but excluded from the score — in
+    19→    19→ *     irrigated systems the planting WINDOW depends on thermal and
+    20→    20→ *     light conditions, and water availability is a separate farmer
+    21→    21→ *     input already handled by the crop recommendation engine.
+    22→    22→ *  2. The growing-cycle experience is scored by averaging the monthly
+    23→    23→ *     scores across the crop's documented duration starting at each
+    24→    24→ *     month. Planting score = 0.4 × planting-month score + 0.6 ×
+    25→    25→ *     cycle score.
+    26→    26→ *  3. Seasons (Egyptian convention: winter Nov–Dec, spring Feb–Mar,
+    27→    27→ *     summer May–Jun, autumn Sep–Oct) are assessed from their months —
+    28→    28→ *     never from the crop name alone.
+    29→    29→ *  4. The Plant Now / Wait / Not Recommended decision compares the
+    30→    30→ *     CURRENT month's suitability with the coming months', adding
+    31→    31→ *     imminent-stress checks from real recent observations and — when
+    32→    32→ *     available — a real 7-day forecast.
+    33→    33→ *
+    34→    34→ * Thresholds (transparent methodology choices, shown in the UI):
+    35→    35→ *   score ≥ 70 → suitable · 45–69 → caution · < 45 → unsuitable.
+    36→    36→ */
+    37→    37→
+    38→    38→import { CROPS, getCrop, type CropRecord } from "./crops";
+    39→    39→import { rangeFit } from "./engine";
+    40→    40→import { L, SEASON_PLANTING_MONTHS, type Bilingual, type Season } from "./types";
+    41→    41→import type {
+    42→    42→  ClimatologyInfo,
+    43→    43→  MultiYearInfo,
+    44→    44→  RecentConditions,
+    45→    45→} from "./types";
+    46→    46→
+    47→    47→/* ---------- crop search by free text (client + server) ---------- */
+    48→    48→
+    49→    49→const ALIASES: Record<string, string[]> = {
+    50→    50→  sugarcane: ["sugar cane", "cane", "قصب", "قصب السكر", "القصب", "sugarcanes"],
+    51→    51→  wheat: ["قمح", "القمح", "قمح الخبز", "bread wheat", "wheats"],
+    52→    52→  maize: ["corn", "ذرة", "الذرة", "corn crop", "maizes"],
+    53→    53→  rice: ["أرز", "الارز", "الأرز", "أرز شعيرية", "paddy", "rices"],
+    54→    54→  tomato: ["tomatoes", "طماطم", "الطماطم", "بندورة", "طماطيم", "tomatos"],
+    55→    55→  potato: ["potatoes", "بطاطس", "البطاطس", "بطاطا", "potatos"],
+    56→    56→  onion: ["onions", "بصل", "البصل", "بصلة", "oniones"],
+    57→    57→};
+    58→    58→
+    59→    59→const normalize = (s: string) =>
+    60→    60→  s
+    61→    61→    .toLowerCase()
+    62→    62→    .replace(/[\u064B-\u0652\u0670\u0640]/g, "") // Arabic diacritics + tatweel
+    63→    63→    .replace(/[أإآ]/g, "ا")
+    64→    64→    .replace(/ى/g, "ي")
+    65→    65→    .replace(/ة/g, "ه")
+    66→    66→    .trim();
+    67→    67→
+    68→    68→export function searchCrops(query: string): CropRecord[] {
+    69→    69→  const q = normalize(query);
+    70→    70→  if (!q) return [];
+    71→    71→  const scored: { crop: CropRecord; rank: number }[] = [];
+    72→    72→  for (const crop of CROPS) {
+    73→    73→    const names = [
+    74→    74→      crop.id,
+    75→    75→      crop.name.en,
+    76→    76→      crop.name.ar,
+    77→    77→      ...(ALIASES[crop.id] ?? []),
+    78→    78→    ].map(normalize);
+    79→    79→    let rank = -1;
+    80→    80→    for (const n of names) {
+    81→    81→      if (n === q) rank = Math.max(rank, 3);
+    82→    82→      else if (n.startsWith(q)) rank = Math.max(rank, 2);
+    83→    83→      else if (q.length >= 3 && n.includes(q)) rank = Math.max(rank, 1);
+    84→    84→    }
+    85→    85→    if (rank > 0) scored.push({ crop, rank });
+    86→    86→  }
+    87→    87→  scored.sort((a, b) => b.rank - a.rank || a.crop.id.localeCompare(b.crop.id));
+    88→    88→  return scored.map((s) => s.crop);
+    89→    89→}
+    90→    90→
+    91→    91→export function resolveCrop(query: string): CropRecord | null {
+    92→    92→  const hits = searchCrops(query);
+    93→    93→  return hits.length ? hits[0] : null;
+    94→    94→}
+    95→    95→
+    96→    96→/* ---------- scoring ---------- */
+    97→    97→
+    98→    98→const clamp = (v: number, lo = 0, hi = 100) => Math.min(hi, Math.max(lo, v));
+    99→    99→const round1 = (v: number) => Math.round(v * 10) / 10;
+   100→   100→
+   101→   101→/** Daytime heat: 100 at/below optimum; linear fall to 0 at absolute max. */
+   102→   102→const dayHeatFit = (meanDailyMax: number, optMax: number, absMax: number) => {
+   103→   103→  if (meanDailyMax <= optMax) return 100;
+   104→   104→  if (meanDailyMax >= absMax) return 0;
+   105→   105→  return clamp(((absMax - meanDailyMax) / (absMax - optMax)) * 100);
+   106→   106→};
+   107→   107→
+   108→   108→/** Night cold: 100 at/above optimum; linear fall to 0 at absolute min. */
+   109→   109→const nightColdFit = (meanDailyMin: number, optMin: number, absMin: number) => {
+   110→   110→  if (meanDailyMin >= optMin) return 100;
+   111→   111→  if (meanDailyMin <= absMin) return 0;
+   112→   112→  return clamp(((meanDailyMin - absMin) / (optMin - absMin)) * 100);
+   113→   113→};
+   114→   114→
+   115→   115→const solarFit = (solar: number, optMin: number, optMax: number) =>
+   116→   116→  rangeFit(solar, optMin * 0.7, optMin, optMax, optMax * 1.35);
+   117→   117→
+   118→   118→const humidityFit = (rh: number, optMin: number, optMax: number) =>
+   119→   119→  rangeFit(rh, Math.max(0, optMin * 0.6), optMin, optMax, Math.min(100, optMax * 1.4));
+   120→   120→
+   121→   121→const windFit = (wind: number, tolerance: number) => {
+   122→   122→  if (wind <= tolerance) return 100;
+   123→   123→  if (wind >= tolerance * 1.6) return 0;
+   124→   124→  return clamp(((tolerance * 1.6 - wind) / (tolerance * 0.6)) * 100);
+   125→   125→};
+   126→   126→
+   127→   127→export type MonthClass = "suitable" | "caution" | "unsuitable";
+   128→   128→
+   129→   129→export interface MonthValues {
+   130→   130→  /** 25-yr mean monthly temperature, °C */
+   131→   131→  t2mMean: number | null;
+   132→   132→  /** 3-yr mean of daily maximum, °C */
+   133→   133→  tMaxMean: number | null;
+   134→   134→  /** 3-yr mean of daily minimum, °C */
+   135→   135→  tMinMean: number | null;
+   136→   136→  /** 25-yr climatological monthly maximum (typical hottest day), °C */
+   137→   137→  tMaxExtreme: number | null;
+   138→   138→  /** 25-yr climatological monthly minimum (typical coldest night), °C */
+   139→   139→  tMinExtreme: number | null;
+   140→   140→  /** 25-yr mean solar radiation, kWh/m²/day */
+   141→   141→  solar: number | null;
+   142→   142→  /** 25-yr mean relative humidity, % */
+   143→   143→  rh: number | null;
+   144→   144→  /** 25-yr mean wind, m/s */
+   145→   145→  wind: number | null;
+   146→   146→  /** 25-yr mean monthly precipitation, mm */
+   147→   147→  precip: number | null;
+   148→   148→}
+   149→   149→
+   150→   150→export interface MonthScore {
+   151→   151→  month: number;
+   152→   152→  /** planting-window score 0-100 */
+   153→   153→  score: number;
+   154→   154→  /** cycle (growing-season) score 0-100 */
+   155→   155→  cycleScore: number | null;
+   156→   156→  /** combined planting score 0-100 */
+   157→   157→  plantingScore: number;
+   158→   158→  classification: MonthClass;
+   159→   159→  factors: {
+   160→   160→    temperature: number | null;
+   161→   161→    dayHeat: number | null;
+   162→   162→    nightCold: number | null;
+   163→   163→    solar: number | null;
+   164→   164→    humidity: number | null;
+   165→   165→    wind: number | null;
+   166→   166→  };
+   167→   167→  values: MonthValues;
+   168→   168→  /** documented rainfall contribution over the crop cycle, mm */
+   169→   169→  cycleRainfallMm: number | null;
+   170→   170→}
+   171→   171→
+   172→   172→export interface SeasonAssessment {
+   173→   173→  season: Season;
+   174→   174→  months: number[];
+   175→   175→  bestMonth: number | null;
+   176→   176→  bestScore: number;
+   177→   177→  classification: MonthClass;
+   178→   178→}
+   179→   179→
+   180→   180→export interface ForecastDayLite {
+   181→   181→  date: string;
+   182→   182→  tmax: number | null;
+   183→   183→  tmin: number | null;
+   184→   184→  precip: number | null;
+   185→   185→  windMax: number | null;
+   186→   186→}
+   187→   187→
+   188→   188→export interface DecisionResult {
+   189→   189→  value: "plant_now" | "wait" | "not_recommended";
+   190→   190→  /** which data the decision is based on (bilingual, honest) */
+   191→   191→  basis: Bilingual;
+   192→   192→  reasons: Bilingual[];
+   193→   193→  warnings: Bilingual[];
+   194→   194→  /** when waiting: the recommended target month */
+   195→   195→  targetMonth: number | null;
+   196→   196→}
+   197→   197→
+   198→   198→export interface PlantingResult {
+   199→   199→  crop: {
+   200→   200→    id: string;
+   201→   201→    name: Bilingual;
+   202→   202→    scientificName: string;
+   203→   203→    variety?: string;
+   204→   204→    /** documented reference info from the crop database */
+   205→   205→    documented: {
+   206→   206→      seasons: Season[];
+   207→   207→      plantingMonths: number[];
+   208→   208→      durationDays: [number, number];
+   209→   209→      temp: CropRecord["temp"];
+   210→   210→      water: CropRecord["water"];
+   211→   211→      references: string[];
+   212→   212→    };
+   213→   213→  };
+   214→   214→  location: { lat: number; lng: number; label: string };
+   215→   215→  months: MonthScore[];
+   216→   216→  seasons: SeasonAssessment[];
+   217→   217→  computed: {
+   218→   218→    recommendedSeason: Season | null;
+   219→   219→    bestMonth: number | null;
+   220→   220→    alternativeMonths: number[];
+   221→   221→    cautionMonths: number[];
+   222→   222→    unsuitableMonths: number[];
+   223→   223→  };
+   224→   224→  decision: DecisionResult;
+   225→   225→  current: {
+   226→   226→    month: number;
+   227→   227→    recent: RecentConditions | null;
+   228→   228→    forecast: {
+   229→   229→      provider: string;
+   230→   230→      days: ForecastDayLite[];
+   231→   231→      retrievedAt: string;
+   232→   232→    } | null;
+   233→   233→    temperatureExplanation: Bilingual;
+   234→   234→    rainfallExplanation: Bilingual;
+   235→   235→    heatStress: Bilingual | null;
+   236→   236→    coldStress: Bilingual | null;
+   237→   237→  };
+   238→   238→  methodology: Bilingual;
+   239→   239→  meta: {
+   240→   240→    climatology: ClimatologyInfo;
+   241→   241→    multiYear: MultiYearInfo;
+   242→   242→    generatedAt: string;
+   243→   243→  };
+   244→   244→}
+   245→   245→
+   246→   246→/* ---------- helpers ---------- */
+   247→   247→
+   248→   248→const MONTHS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+   249→   249→const monthAfter = (m: number, k: number) => ((m - 1 + k) % 12) + 1;
+   250→   250→
+   251→   251→const classify = (score: number): MonthClass =>
+   252→   252→  score >= 70 ? "suitable" : score >= 45 ? "caution" : "unsuitable";
+   253→   253→
+   254→   254→/* ---------- main engine ---------- */
+   255→   255→
+   256→   256→export interface PlantingInput {
+   257→   257→  crop: CropRecord;
+   258→   258→  lat: number;
+   259→   259→  lng: number;
+   260→   260→  label: string;
+   261→   261→  /** the farmer's current month, 1-12 (client local time) */
+   262→   262→  currentMonth: number;
+   263→   263→  variety?: string;
+   264→   264→  climatology: ClimatologyInfo;
+   265→   265→  multiYear: MultiYearInfo;
+   266→   266→  recent: RecentConditions | null;
+   267→   267→  forecast: ForecastDayLite[] | null;
+   268→   268→  forecastProvider?: string;
+   269→   269→  forecastRetrievedAt?: string;
+   270→   270→}
+   271→   271→
+   272→   272→export function runPlantingAdvisor(input: PlantingInput): PlantingResult {
+   273→   273→  const { crop, climatology, multiYear } = input;
+   274→   274→
+   275→   275→  // merge monthly data: 25-yr means + 3-yr daily max/min means
+   276→   276→  const valuesByMonth = new Map<number, MonthValues>();
+   277→   277→  for (const m of MONTHS) {
+   278→   278→    const c = climatology.months.find((x) => x.month === m);
+   279→   279→    const y = multiYear.months.find((x) => x.month === m);
+   280→   280→    valuesByMonth.set(m, {
+   281→   281→      t2mMean: c?.t2mMean ?? y?.t2mMean ?? null,
+   282→   282→      tMaxMean: y?.tMaxMean ?? null,
+   283→   283→      tMinMean: y?.tMinMean ?? null,
+   284→   284→      tMaxExtreme: c?.tMaxExtreme ?? y?.tMaxObserved ?? null,
+   285→   285→      tMinExtreme: c?.tMinExtreme ?? y?.tMinObserved ?? null,
+   286→   286→      solar: c?.solarMean ?? y?.solarMean ?? null,
+   287→   287→      rh: c?.rhMean ?? y?.rhMean ?? null,
+   288→   288→      wind: c?.windMean ?? y?.windMean ?? null,
+   289→   289→      precip: c?.precipMean ?? y?.precipMean ?? null,
+   290→   290→    });
+   291→   291→  }
+   292→   292→
+   293→   293→  const duration =
+   294→   294→    Math.round((crop.durationDays[0] + crop.durationDays[1]) / 2);
+   295→   295→  const durationMonths = Math.max(1, Math.round(duration / 30));
+   296→   296→
+   297→   297→  const factorScore = (m: number) => {
+   298→   298→    const v = valuesByMonth.get(m)!;
+   299→   299→    const temperature =
+   300→   300→      v.t2mMean === null
+   301→   301→        ? null
+   302→   302→        : rangeFit(v.t2mMean, crop.temp.absMin, crop.temp.optMin, crop.temp.optMax, crop.temp.absMax);
+   303→   303→    const dayHeat =
+   304→   304→      v.tMaxMean === null
+   305→   305→        ? null
+   306→   306→        : dayHeatFit(v.tMaxMean, crop.temp.optMax, crop.temp.absMax);
+   307→   307→    const nightCold =
+   308→   308→      v.tMinMean === null
+   309→   309→        ? null
+   310→   310→        : nightColdFit(v.tMinMean, crop.temp.optMin, crop.temp.absMin);
+   311→   311→    const solar =
+   312→   312→      v.solar === null
+   313→   313→        ? null
+   314→   314→        : solarFit(v.solar, crop.solar.optMin, crop.solar.optMax);
+   315→   315→    const humidity =
+   316→   316→      v.rh === null
+   317→   317→        ? null
+   318→   318→        : humidityFit(v.rh, crop.humidity.optMin, crop.humidity.optMax);
+   319→   319→    const wind =
+   320→   320→      v.wind === null ? null : windFit(v.wind, crop.windTolerance);
+   321→   321→    return { temperature, dayHeat, nightCold, solar, humidity, wind };
+   322→   322→  };
+   323→   323→
+   324→   324→  // weighted month score (weights sum to 1; rainfall excluded — see header)
+   325→   325→  const W = { temperature: 0.35, dayHeat: 0.25, nightCold: 0.15, solar: 0.15, humidity: 0.05, wind: 0.05 };
+   326→   326→  const monthScoreOf = (m: number): number | null => {
+   327→   327→    const f = factorScore(m);
+   328→   328→    const parts: [number, number][] = [
+   329→   329→      [W.temperature, f.temperature],
+   330→   330→      [W.dayHeat, f.dayHeat],
+   331→   331→      [W.nightCold, f.nightCold],
+   332→   332→      [W.solar, f.solar],
+   333→   333→      [W.humidity, f.humidity],
+   334→   334→      [W.wind, f.wind],
+   335→   335→    ];
+   336→   336→    let sum = 0;
+   337→   337→    let wsum = 0;
+   338→   338→    for (const [w, s] of parts) {
+   339→   339→      if (s !== null) {
+   340→   340→        sum += w * s;
+   341→   341→        wsum += w;
+   342→   342→      }
+   343→   343→    }
+   344→   344→    // renormalise over available factors
+   345→   345→    return wsum >= 0.5 ? sum / wsum : null;
+   346→   346→  };
+   347→   347→
+   348→   348→  const rainOverCycle = (m: number): number | null => {
+   349→   349→    let total = 0;
+   350→   350→    let any = false;
+   351→   351→    for (let k = 0; k < durationMonths; k++) {
+   352→   352→      const p = valuesByMonth.get(monthAfter(m, k))?.precip ?? null;
+   353→   353→      if (p !== null) {
+   354→   354→        total += p;
+   355→   355→        any = true;
+   356→   356→      }
+   357→   357→    }
+   358→   358→    return any ? total : null;
+   359→   359→  };
+   360→   360→
+   361→   361→  const months: MonthScore[] = MONTHS.map((m) => {
+   362→   362→    const f = factorScore(m);
+   363→   363→    const score = monthScoreOf(m);
+   364→   364→    // cycle score: mean month score across the documented duration
+   365→   365→    const cycle: (number | null)[] = [];
+   366→   366→    for (let k = 0; k < durationMonths; k++) {
+   367→   367→      cycle.push(monthScoreOf(monthAfter(m, k)));
+   368→   368→    }
+   369→   369→    const validCycle = cycle.filter((c): c is number => c !== null);
+   370→   370→    const cycleScore = validCycle.length
+   371→   371→      ? validCycle.reduce((a, b) => a + b, 0) / validCycle.length
+   372→   372→      : null;
+   373→   373→    const plantingScore =
+   374→   374→      score === null
+   375→   375→        ? 0
+   376→   376→        : cycleScore === null
+   377→   377→          ? score
+   378→   378→          : 0.4 * score + 0.6 * cycleScore;
+   379→   379→    return {
+   380→   380→      month: m,
+   381→   381→      score: score === null ? 0 : round1(score),
+   382→   382→      cycleScore: cycleScore === null ? null : round1(cycleScore),
+   383→   383→      plantingScore: round1(plantingScore),
+   384→   384→      classification: classify(plantingScore),
+   385→   385→      factors: {
+   386→   386→        temperature: f.temperature === null ? null : round1(f.temperature),
+   387→   387→        dayHeat: f.dayHeat === null ? null : round1(f.dayHeat),
+   388→   388→        nightCold: f.nightCold === null ? null : round1(f.nightCold),
+   389→   389→        solar: f.solar === null ? null : round1(f.solar),
+   390→   390→        humidity: f.humidity === null ? null : round1(f.humidity),
+   391→   391→        wind: f.wind === null ? null : round1(f.wind),
+   392→   392→      },
+   393→   393→      values: valuesByMonth.get(m)!,
+   394→   394→      cycleRainfallMm:
+   395→   395→        rainOverCycle(m) === null ? null : round1(rainOverCycle(m)!),
+   396→   396→    };
+   397→   397→  });
+   398→   398→
+   399→   399→  // season assessment — computed from climate, not from the crop name
+   400→   400→  const seasons: SeasonAssessment[] = (Object.keys(SEASON_PLANTING_MONTHS) as Season[]).map(
+   401→   401→    (season) => {
+   402→   402→      const ms = SEASON_PLANTING_MONTHS[season];
+   403→   403→      const scores = ms
+   404→   404→        .map((m) => months[m - 1])
+   405→   405→        .filter((row) => row.plantingScore !== undefined);
+   406→   406→      const best = scores.reduce(
+   407→   407→        (acc, cur) => (cur.plantingScore > acc.plantingScore ? cur : acc),
+   408→   408→        scores[0]
+   409→   409→      );
+   410→   410→      return {
+   411→   411→        season,
+   412→   412→        months: ms,
+   413→   413→        bestMonth: best ? best.month : null,
+   414→   414→        bestScore: best ? best.plantingScore : 0,
+   415→   415→        classification: best ? classify(best.plantingScore) : "unsuitable",
+   416→   416→      };
+   417→   417→    }
+   418→   418→  );
+   419→   419→
+   420→   420→  const rankedMonths = [...months].sort((a, b) => b.plantingScore - a.plantingScore);
+   421→   421→  const best = rankedMonths[0];
+   422→   422→  const suitableMonths = months.filter((m) => m.classification === "suitable");
+   423→   423→  const cautionMonths = months.filter((m) => m.classification === "caution");
+   424→   424→  const unsuitableMonths = months.filter((m) => m.classification === "unsuitable");
+   425→   425→
+   426→   426→  // recommended season = best-scoring season whose best month is suitable
+   427→   427→  const recommendedSeason =
+   428→   428→    [...seasons]
+   429→   429→      .sort((a, b) => b.bestScore - a.bestScore)[0]?.classification === "suitable"
+   430→   430→      ? [...seasons].sort((a, b) => b.bestScore - a.bestScore)[0].season
+   431→   431→      : null;
+   432→   432→
+   433→   433→  /* ------- current-conditions explanations (real numbers) ------- */
+   434→   434→
+   435→   435→  const cur = valuesByMonth.get(input.currentMonth)!;
+   436→   436→  const curMonthRow = months[input.currentMonth - 1];
+   437→   437→
+   438→   438→  const temperatureExplanation =
+   439→   439→    cur.t2mMean === null
+   440→   440→      ? L(
+   441→   441→          "Temperature data for this month is unavailable from NASA POWER for this location.",
+   442→   442→          "بيانات درجات الحرارة لهذا الشهر غير متاحة من NASA POWER لهذا الموقع."
+   443→   443→        )
+   444→   444→      : L(
+   445→   445→          `The 25-year average temperature for month ${input.currentMonth} at this location is ${round1(cur.t2mMean)}°C; the documented optimum for ${crop.name.en} (${crop.scientificName}) is ${crop.temp.optMin}–${crop.temp.optMax}°C, with absolute limits ${crop.temp.absMin}°C to ${crop.temp.absMax}°C.`,
+   446→   446→          `متوسط درجة الحرارة على مدى 25 عامًا لهذا الشهر في هذا الموقع هو ${round1(cur.t2mMean)}°م، والمدى الأمثل الموثق لـ${crop.name.ar} (${crop.scientificName}) هو ${crop.temp.optMin}–${crop.temp.optMax}°م، والحدود المطلقة من ${crop.temp.absMin} إلى ${crop.temp.absMax}°م.`
+   447→   447→        );
+   448→   448→
+   449→   449→  const annualRain = climatology.months.reduce(
+   450→   450→    (a, m) => a + (m.precipMean ?? 0),
+   451→   451→    0
+   452→   452→  );
+   453→   453→  const rainfallExplanation =
+   454→   454→    L(
+   455→   455→      `Rainfall here averages only ${round1(annualRain)} mm/year over 25 years (${round1(cur.precip ?? 0)} mm in the current month) — far below the documented seasonal need of ${crop.water.seasonNeedMm[0]}–${crop.water.seasonNeedMm[1]} mm. Farming at this location is irrigation-based: planting dates are governed by temperature, light and wind, and your irrigation water availability must cover the full requirement.`,
+   456→   456→      `الهطل هنا يبلغ في المتوسط ${round1(annualRain)} مم/سنة فقط على مدى 25 عامًا (${round1(cur.precip ?? 0)} مم في الشهر الحالي) — أي أقل بكثير من الاحتياج الموسمي الموثق البالغ ${crop.water.seasonNeedMm[0]}–${crop.water.seasonNeedMm[1]} مم. الزراعة في هذا الموقع تعتمد على الري: مواعيد الزراعة تحكمها الحرارة والإضاءة والرياح، ويجب أن يغطي ماء الري لديك كامل الاحتياج.`
+   457→   457→    );
+   458→   458→
+   459→   459→  // heat stress: months where the typical day max is above the documented optimum
+   460→   460→  const heatMonths = months.filter(
+   461→   461→    (m) =>
+   462→   462→      (m.values.tMaxMean ?? -99) > crop.temp.optMax ||
+   463→   463→      (m.values.tMaxExtreme ?? -99) > crop.temp.absMax
+   464→   464→  );
+   465→   465→  const heatStress =
+   466→   466→    heatMonths.length && heatMonths.some((m) => m.values.tMaxMean !== null)
+   467→   467→      ? L(
+   468→   468→          `Heat stress period: in ${heatMonths
+   469→   469→            .map((m) => m.month)
+   470→   470→            .sort((a, b) => a - b)
+   471→   471→            .join(", ")} the mean daily maximum reaches ${round1(
+   472→   472→            Math.max(...heatMonths.map((m) => m.values.tMaxMean ?? -99))
+   473→   473→          )}°C and the typical hottest day about ${round1(
+   474→   474→            Math.max(...heatMonths.map((m) => m.values.tMaxExtreme ?? -99))
+   475→   475→          )}°C — beyond the documented optimum (${crop.temp.optMax}°C) and, on the hottest days, near or above the absolute limit (${crop.temp.absMax}°C). Avoid planting so that sensitive stages fall in these months.`,
+   476→   476→          `فترة الإجهاد الحراري: في الأشهر ${heatMonths
+   477→   477→            .map((m) => m.month)
+   478→   478→            .sort((a, b) => a - b)
+   479→   479→            .join(", ")} يبلغ متوسط الحرارة القصوى اليومية نحو ${round1(
+   480→   480→            Math.max(...heatMonths.map((m) => m.values.tMaxMean ?? -99))
+   481→   481→          )}°م وأعلى يوم نموذجي نحو ${round1(
+   482→   482→            Math.max(...heatMonths.map((m) => m.values.tMaxExtreme ?? -99))
+   483→   483→          )}°م — خارج المدى الأمثل الموثق (${crop.temp.optMax}°م) وقريب من الحد المطلق (${crop.temp.absMax}°م) أو فوقه في الأيام الأشد حرًا. تجنب أن تقع المراحل الحساسة في هذه الأشهر.`
+   484→   484→        )
+   485→   485→      : null;
+   486→   486→
+   487→   487→  const coldMonths = months.filter(
+   488→   488→    (m) =>
+   489→   489→      (m.values.tMinMean ?? 99) < crop.temp.optMin ||
+   490→   490→      (m.values.tMinExtreme ?? 99) < crop.temp.absMin
+   491→   491→  );
+   492→   492→  const coldStress =
+   493→   493→    coldMonths.length
+   494→   494→      ? L(
+   495→   495→          `Cold stress period: in ${coldMonths
+   496→   496→            .map((m) => m.month)
+   497→   497→            .sort((a, b) => a - b)
+   498→   498→            .join(", ")} the mean daily minimum falls to ${round1(
+   499→   499→            Math.min(...coldMonths.map((m) => m.values.tMinMean ?? 99))
+   500→   500→          )}°C and the typical coldest night to about ${round1(
+   501→   501→            Math.min(...coldMonths.map((m) => m.values.tMinExtreme ?? 99))
+   502→   502→          )}°C — below the documented optimum minimum (${crop.temp.optMin}°C)${" "}
+   503→   503→          and potentially near the absolute limit (${crop.temp.absMin}°C).`,
+   504→   504→          `فترة الإجهاد البارد: في الأشهر ${coldMonths
+   505→   505→            .map((m) => m.month)
+   506→   506→            .sort((a, b) => a - b)
+   507→   507→            .join(", ")} ينخفض متوسط الحرارة الدنيا اليومية إلى نحو ${round1(
+   508→   508→            Math.min(...coldMonths.map((m) => m.values.tMinMean ?? 99))
+   509→   509→          )}°م وأبرد ليلة نموذجية إلى نحو ${round1(
+   510→   510→            Math.min(...coldMonths.map((m) => m.values.tMinExtreme ?? 99))
+   511→   511→          )}°م — دون الحد الأدنى الأمثل الموثق (${crop.temp.optMin}°م) وربما قريبًا من الحد المطلق (${crop.temp.absMin}°م).`
+   512→   512→        )
+   513→   513→      : null;
+   514→   514→
+   515→   515→  /* ------- the decision ------- */
+   516→   516→
+   517→   517→  const M = input.currentMonth;
+   518→   518→  const nowScore = curMonthRow.plantingScore;
+   519→   519→  const warnings: Bilingual[] = [];
+   520→   520→  const reasons: Bilingual[] = [];
+   521→   521→
+   522→   522→  // imminent stress from real recent observations
+   523→   523→  if (input.recent) {
+   524→   524→    if (
+   525→   525→      input.recent.tMaxObserved !== null &&
+   526→   526→      input.recent.tMaxObserved >= crop.temp.absMax
+   527→   527→    ) {
+   528→   528→      warnings.push(
+   529→   529→        L(
+   530→   530→          `Recent satellite observations show a daily maximum of ${round1(input.recent.tMaxObserved)}°C (data through ${input.recent.latestObservationDate}) — at/above the crop's documented absolute maximum of ${crop.temp.absMax}°C.`,
+   531→   531→          `تُظهر مشاهدات الأقمار الصناعية الأخيرة حدًا يوميًا أقصى ${round1(input.recent.tMaxObserved)}°م (بيانات حتى ${input.recent.latestObservationDate}) — عند/فوق الحد الأقصى المطلق الموثق للمحصول (${crop.temp.absMax}°م).`
+   532→   532→        )
+   533→   533→      );
+   534→   534→    }
+   535→   535→    if (
+   536→   536→      input.recent.tMinObserved !== null &&
+   537→   537→      input.recent.tMinObserved <= crop.temp.absMin
+   538→   538→    ) {
+   539→   539→      warnings.push(
+   540→   540→        L(
+   541→   541→          `Recent observations show a daily minimum of ${round1(input.recent.tMinObserved)}°C — at/below the crop's documented absolute minimum of ${crop.temp.absMin}°C.`,
+   542→   542→          `تُظهر المشاهدات الأخيرة حدًا يوميًا أدنى ${round1(input.recent.tMinObserved)}°م — عند/دون الحد الأدنى المطلق الموثق للمحصول (${crop.temp.absMin}°م).`
+   543→   543→        )
+   544→   544→      );
+   545→   545→    }
+   546→   546→  }
+   547→   547→
+   548→   548→  // imminent stress from the real forecast (when available)
+   549→   549→  let imminentForecastStress = false;
+   550→   550→  if (input.forecast && input.forecast.length) {
+   551→   551→    const hotDays = input.forecast.filter(
+   552→   552→      (d) => d.tmax !== null && d.tmax >= crop.temp.absMax
+   553→   553→    );
+   554→   554→    const coldNights = input.forecast.filter(
+   555→   555→      (d) => d.tmin !== null && d.tmin <= crop.temp.absMin
+   556→   556→    );
+   557→   557→    if (hotDays.length) {
+   558→   558→      imminentForecastStress = true;
+   559→   559→      warnings.push(
+   560→   560→        L(
+   561→   561→          `The 7-day forecast includes ${hotDays.length} day(s) reaching ${round1(Math.max(...hotDays.map((d) => d.tmax ?? -99)))}°C — at/above the crop's documented absolute maximum.`,
+   562→   562→          `تشمل توقعات الأيام السبعة ${hotDays.length} يومًا تصل فيها الحرارة إلى ${round1(Math.max(...hotDays.map((d) => d.tmax ?? -99)))}°م — عند/فوق الحد الأقصى المطلق الموثق.`
+   563→   563→        )
+   564→   564→      );
+   565→   565→    }
+   566→   566→    if (coldNights.length) {
+   567→   567→      imminentForecastStress = true;
+   568→   568→      warnings.push(
+   569→   569→        L(
+   570→   570→          `The 7-day forecast includes ${coldNights.length} night(s) falling to ${round1(Math.min(...coldNights.map((d) => d.tmin ?? 99)))}°C — at/below the crop's documented absolute minimum.`,
+   571→   571→          `تشمل توقعات الأيام السبعة ${coldNights.length} ليلة تنخفض فيها الحرارة إلى ${round1(Math.min(...coldNights.map((d) => d.tmin ?? 99)))}°م — عند/دون الحد الأدنى المطلق الموثق.`
+   572→   572→        )
+   573→   573→      );
+   574→   574→    }
+   575→   575→  }
+   576→   576→
+   577→   577→  // next suitable month (searching forward from the month after current)
+   578→   578→  let targetMonth: number | null = null;
+   579→   579→  for (let k = 1; k <= 12; k++) {
+   580→   580→    const m = monthAfter(M, k);
+   581→   581→    if (months[m - 1].classification === "suitable") {
+   582→   582→      targetMonth = m;
+   583→   583→      break;
+   584→   584→    }
+   585→   585→  }
+   586→   586→
+   587→   587→  const basisHistorical = L(
+   588→   588→    "Based on a 25-year NASA POWER climatology for this location, ~3 years of daily observations and the documented crop requirements (FAO / Egyptian extension references).",
+   589→   589→    "يعتمد على مناخ 25 عامًا من NASA POWER لهذا الموقع، ونحو 3 أعوام من المشاهدات اليومية، والاشتراطات الموثقة للمحصول (مراجع FAO والإرشاد المصري)."
+   590→   590→  );
+   591→   591→  const basisWithObs = L(
+   592→   592→    "Based on the 25-year NASA POWER climatology, recent satellite observations (last ~60 days) and the documented crop requirements. The 7-day weather forecast was also checked (Open-Meteo).",
+   593→   593→    "يعتمد على مناخ 25 عامًا من NASA POWER، والمشاهدات الفضائية الأخيرة (آخر 60 يومًا تقريبًا)، والاشتراطات الموثقة للمحصول، مع فحص توقعات الطقس لسبعة أيام (Open-Meteo)."
+   594→   594→  );
+   595→   595→  const obsNote = input.recent
+   596→   596→    ? ` Latest NASA POWER observation available: ${input.recent.latestObservationDate}.`
+   597→   597→    : "";
+   598→   598→
+   599→   599→  let decision: DecisionResult;
+   600→   600→  if (nowScore >= 70 && !imminentForecastStress) {
+   601→   601→    decision = {
+   602→   602→      value: "plant_now",
+   603→   603→      basis: L(
+   604→   604→        `The current month scores ${round1(nowScore)}/100 for planting suitability.` +
+   605→   605→          (input.forecast ? basisWithObs.en : basisHistorical.en) + obsNote,
+   606→   606→        `الشهر الحالي يحصل على ${round1(nowScore)}/100 لملاءمة الزراعة.` +
+   607→   607→          (input.forecast ? basisWithObs.ar : basisHistorical.ar) + obsNote
+   608→   608→      ),
+   609→   609→      reasons: [
+   610→   610→        L(
+   611→   611→          `Month ${M} conditions sit inside the crop's documented temperature, radiation and humidity ranges at this location.`,
+   612→   612→          `ظروف الشهر ${M} تقع داخل المداقات الموثقة للحرارة والإشعاع والرطوبة لهذا المحصول في هذا الموقع.`
+   613→   613→        ),
+   614→   614→      ],
+   615→   615→      warnings,
+   616→   616→      targetMonth: null,
+   617→   617→    };
+   618→   618→  } else if (nowScore >= 70 && imminentForecastStress) {
+   619→   619→    decision = {
+   620→   620→      value: "wait",
+   621→   621→      basis: L(
+   622→   622→        `The month is generally suitable (${round1(nowScore)}/100) but imminent extreme temperatures appear in the forecast; waiting a few days for the event to pass is safer.` +
+   623→   623→          (input.forecast ? "" : "") + obsNote,
+   624→   624→        `الشهر مناسب عمومًا (${round1(nowScore)}/100) لكن تظهر درجات حرارة قاسية وشيكة في التوقعات؛ الانتظار أيامًا حتى مرورها أكثر أمانًا.` + obsNote
+   625→   625→      ),
+   626→   626→      reasons: [
+   627→   627→        L(
+   628→   628→          "Planting immediately before a documented-limit heat or cold event risks crop failure at establishment.",
+   629→   629→          "الزراعة مباشرة قبل موجة حرارة أو برد عند الحدود الموثقة تعرّض المحصول لخطر الفشل عند الإنشاء."
+   630→   630→        ),
+   631→   631→      ],
+   632→   632→      warnings,
+   633→   633→      targetMonth,
+   634→   634→    };
+   635→   635→  } else if (targetMonth !== null) {
+   636→   636→    const tm = months[targetMonth - 1];
+   637→   637→    const monthsAway = (targetMonth - M + 12) % 12 || 12;
+   638→   638→    decision = {
+   639→   639→      value: "wait",
+   640→   640→      basis: L(
+   641→   641→        `Current month scores ${round1(nowScore)}/100 (below the 70 suitability threshold); a better window opens in month ${targetMonth} (${round1(tm.plantingScore)}/100), about ${monthsAway} month(s) away.` +
+   642→   642→          basisHistorical.en + obsNote,
+   643→   643→        `الشهر الحالي يحصل على ${round1(nowScore)}/100 (دون حد الملاءمة 70)؛ ويفتح نافذة أفضل في الشهر ${targetMonth} (${round1(tm.plantingScore)}/100)، أي بعد نحو ${monthsAway} شهر.` +
+   644→   644→          basisHistorical.ar + obsNote
+   645→   645→      ),
+   646→   646→      reasons: [
+   647→   647→        L(
+   648→   648→          `Month ${M}'s temperature pattern (mean ${round1(cur.t2mMean ?? NaN)}°C, mean daily max ${round1(cur.tMaxMean ?? NaN)}°C) falls outside the crop's documented optimum of ${crop.temp.optMin}–${crop.temp.optMax}°C.`,
+   649→   649→          `نمط حرارة الشهر ${M} (متوسط ${round1(cur.t2mMean ?? NaN)}°م، متوسط الأقصى اليومي ${round1(cur.tMaxMean ?? NaN)}°م) يقع خارج المدى الأمثل الموثق ${crop.temp.optMin}–${crop.temp.optMax}°م.`
+   650→   650→        ),
+   651→   651→      ],
+   652→   652→      warnings,
+   653→   653→      targetMonth,
+   654→   654→    };
+   655→   655→  } else {
+   656→   656→    // no suitable month at all
+   657→   657→    decision = {
+   658→   658→      value: "not_recommended",
+   659→   659→      basis: L(
+   660→   660→        `No month at this location reaches the 70 suitability threshold for the documented requirements of this crop; the best month scores ${round1(best.plantingScore)}/100.` +
+   661→   661→          basisHistorical.en,
+   662→   662→        `لا يصل أي شهر في هذا الموقع إلى حد الملاءمة 70 وفق الاشتراطات الموثقة لهذا المحصول؛ أفضل شهر يحصل على ${round1(best.plantingScore)}/100.` +
+   663→   663→          basisHistorical.ar
+   664→   664→      ),
+   665→   665→      reasons: [
+   666→   666→        L(
+   667→   667→          `The crop's documented requirements (${crop.temp.optMin}–${crop.temp.optMax}°C optimum) do not fit this location's climate pattern for any planting month.`,
+   668→   668→          `الاشتراطات الموثقة للمحصول (المدى الأمثل ${crop.temp.optMin}–${crop.temp.optMax}°م) لا تتوافق مع النمط المناخي لهذا الموقع في أي شهر زراعة.`
+   669→   669→        ),
+   670→   670→      ],
+   671→   671→      warnings,
+   672→   672→      targetMonth: null,
+   673→   673→    };
+   674→   674→  }
+   675→   675→
+   676→   676→  const methodology = L(
+   677→   677→    `Each month is scored 0–100 against the crop's documented requirements using the 25-year climatology (temperature 35%, daytime heat from multi-year mean daily maxima 25%, night cold 15%, solar radiation 15%, humidity 5%, wind 5%). The planting score blends the planting-month score (40%) with the growing-cycle score (60%) over the documented duration of ${duration} days. ≥70 suitable, 45–69 caution, <45 unsuitable. Rainfall is reported but excluded from the score — this is an irrigated system and water availability is captured separately.`,
+   678→   678→    `يقيَّم كل شهر من 0 إلى 100 مقابل الاشتراطات الموثقة للمحصول باستخدام مناخ 25 عامًا (الحرارة 35%، حرارة النهار من متوسطات القصوى اليومية لعدة أعوام 25%، برد الليل 15%، الإشعاع الشمسي 15%، الرطوبة 5%، الرياح 5%). ثم يمزج تقدير الزراعة بين درجة شهر الزراعة (40%) ودرجة دورة النمو (60%) على مدى المدة الموثقة ${duration} يومًا. ≥70 مناسب، 45–69 حذر، <45 غير مناسب. يُعرض الهطل دون إدراجه في التقدير — فهذا نظام ريّ، وتوافر الماء يُقيَّم منفصلًا.`
+   679→   679→  );
+   680→   680→
+   681→   681→  return {
+   682→   682→    crop: {
+   683→   683→      id: crop.id,
+   684→   684→      name: crop.name,
+   685→   685→      scientificName: crop.scientificName,
+   686→   686→      variety: input.variety,
+   687→   687→      documented: {
+   688→   688→        seasons: crop.seasons,
+   689→   689→        plantingMonths: crop.plantingMonths,
+   690→   690→        durationDays: crop.durationDays,
+   691→   691→        temp: crop.temp,
+   692→   692→        water: crop.water,
+   693→   693→        references: crop.references,
+   694→   694→      },
+   695→   695→    },
+   696→   696→    location: { lat: input.lat, lng: input.lng, label: input.label },
+   697→   697→    months,
+   698→   698→    seasons,
+   699→   699→    computed: {
+   700→   700→      recommendedSeason,
+   701→   701→      bestMonth: best.plantingScore >= 45 ? best.month : null,
+   702→   702→      alternativeMonths: suitableMonths
+   703→   703→        .map((m) => m.month)
+   704→   704→        .filter((m) => m !== (best.plantingScore >= 45 ? best.month : -1)),
+   705→   705→      cautionMonths: cautionMonths.map((m) => m.month),
+   706→   706→      unsuitableMonths: unsuitableMonths.map((m) => m.month),
+   707→   707→    },
+   708→   708→    decision,
+   709→   709→    current: {
+   710→   710→      month: M,
+   711→   711→      recent: input.recent,
+   712→   712→      forecast:
+   713→   713→        input.forecast && input.forecast.length
+   714→   714→          ? {
+   715→   715→              provider: input.forecastProvider ?? "Open-Meteo",
+   716→   716→              days: input.forecast,
+   717→   717→              retrievedAt: input.forecastRetrievedAt ?? new Date().toISOString(),
+   718→   718→            }
+   719→   719→          : null,
+   720→   720→      temperatureExplanation,
+   721→   721→      rainfallExplanation,
+   722→   722→      heatStress,
+   723→   723→      coldStress,
+   724→   724→    },
+   725→   725→    methodology,
+   726→   726→    meta: {
+   727→   727→      climatology,
+   728→   728→      multiYear,
+   729→   729→      generatedAt: new Date().toISOString(),
+   730→   730→    },
+   731→   731→  };
+   732→   732→}
+   733→   733→
+   734→   734→export { getCrop };
+   735→   735→
