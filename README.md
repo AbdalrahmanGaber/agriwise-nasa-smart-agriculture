@@ -1,5 +1,7 @@
 # Field Shift — NASA-Powered Smart Agriculture Platform
 
+link of website:- https://agriwise.space-z.ai/
+
 *Internal application name: AgriWise (established by the existing codebase and preserved).*
 
 A complete, bilingual (English/Arabic) agricultural decision-support platform for
